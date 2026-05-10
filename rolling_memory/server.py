@@ -40,17 +40,20 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
 # 当前活跃的 CC 会话（搜索时自动排除）
 _active_cc_conv: str | None = None
+# 当前项目名（用于默认项目过滤）
+_current_project: str = ""
 
 
 def _detect_active_session():
-    """检测当前正在进行的 Claude Code 会话，搜索时排除"""
-    global _active_cc_conv
+    """检测当前正在进行的 Claude Code 会话和项目"""
+    global _active_cc_conv, _current_project
     cc_dir = Path.home() / ".claude" / "projects"
     if not cc_dir.exists():
         return
 
     latest_file = None
     latest_mtime = 0
+    latest_project = ""
     for project_dir in cc_dir.iterdir():
         if not project_dir.is_dir():
             continue
@@ -60,12 +63,14 @@ def _detect_active_session():
                 if mtime > latest_mtime:
                     latest_mtime = mtime
                     latest_file = jsonl_file
+                    latest_project = project_dir.name
             except OSError:
                 continue
 
     if latest_file:
         _active_cc_conv = f"cc_{latest_file.stem}"
-        _log(f"当前活跃会话: {_active_cc_conv}，搜索时自动排除")
+        _current_project = latest_project
+        _log(f"当前项目: {_current_project}, 活跃会话: {_active_cc_conv}")
 
 
 def _text(lines: list[str]) -> str:
@@ -127,6 +132,13 @@ def _build_filters(source: str, date_from: str, date_to: str,
     return where, params
 
 
+def _project_where(project: str, table_prefix: str = "c") -> tuple[str, list]:
+    """构建项目过滤条件。project="" 表示不过滤。"""
+    if not project:
+        return "", []
+    return f"AND {table_prefix}.metadata LIKE ?", [f'%"project": "{project}"%']
+
+
 # ── memory_search: 核心搜索 ───────────────────────────
 
 @mcp.tool(annotations=READ_ONLY)
@@ -136,18 +148,19 @@ def memory_search(
     source: str = "",
     date_from: str = "",
     date_to: str = "",
-    scope: str = "segments",
+    scope: str = "chunks",
     time_decay: float = 0.05,
     top_k: int = 10,
     exclude_current: bool = True,
+    project: str = "current",
 ) -> str:
-    """搜索对话记忆。
+    """搜索当前项目的对话记忆。只搜索当前项目，需要全局搜索用 memory_search_global。
     mode: keyword(FTS5)/semantic(向量,需GPU)。
     source: 过滤平台(claude/gemini/gpt/workbuddy/claude_code)。
     date_from/date_to: 日期范围(YYYY-MM-DD)。
     scope: segments/chunks。
     time_decay: 时间衰减因子(0=关闭, 0.05=默认约20天半衰期)。
-    exclude_current: 排除当前活跃的 Claude Code 会话(默认true)。
+    project: 项目名(默认"current"=当前项目)。用 memory_projects 查看所有项目名。
     """
     conn = _conn()
     try:
@@ -162,8 +175,10 @@ def memory_search(
 
 
 def _search_keyword(conn, query, source, date_from, date_to,
-                    scope, time_decay, top_k, exclude_current=True) -> str:
+                    scope, time_decay, top_k, exclude_current=True,
+                    project: str = "") -> str:
     exclude = _active_cc_conv if exclude_current else ""
+    proj = _current_project if project == "current" else project
 
     if " " in query or "-" in query or "." in query:
         fts_query = f'"{query}"'
@@ -173,7 +188,7 @@ def _search_keyword(conn, query, source, date_from, date_to,
     if scope == "chunks":
         return _search_keyword_chunks(conn, fts_query, query, source,
                                       date_from, date_to, time_decay, top_k,
-                                      exclude_conv=exclude)
+                                      exclude_conv=exclude, project=proj)
 
     # 尝试 segments 级搜索（P3，需要 conv_segments 表）
     where, params = _build_filters(source, date_from, date_to, table_prefix="ci",
@@ -195,7 +210,7 @@ def _search_keyword(conn, query, source, date_from, date_to,
     except sqlite3.OperationalError:
         return _search_keyword_chunks(conn, fts_query, query, source,
                                       date_from, date_to, time_decay, top_k,
-                                      exclude_conv=exclude)
+                                      exclude_conv=exclude, project=proj)
 
     if not rows:
         return f"未找到 '{query}'"
@@ -217,10 +232,14 @@ def _search_keyword(conn, query, source, date_from, date_to,
 
 def _search_keyword_chunks(conn, fts_query, query, source, date_from,
                            date_to, time_decay, top_k,
-                           exclude_conv: str = "") -> str:
+                           exclude_conv: str = "",
+                           project: str = "") -> str:
     """搜原始对话消息"""
     where, params = _build_filters(source, date_from, date_to,
                                    exclude_conv=exclude_conv)
+    proj_where, proj_params = _project_where(project)
+    where += proj_where
+    params += proj_params
 
     try:
         sql = f"""
@@ -647,6 +666,69 @@ def memory_query(sql: str, limit: int = 50) -> str:
         return _text(lines)
     except Exception as e:
         return f"SQL错误: {e}"
+    finally:
+        conn.close()
+
+
+# ── memory_projects: 列出项目 ─────────────────────────
+
+@mcp.tool(annotations=READ_ONLY)
+def memory_projects() -> str:
+    """列出所有已导入的项目及其对话数量。用于按项目搜索时获取项目名。"""
+    conn = _conn()
+    try:
+        rows = conn.execute("""
+            SELECT
+                json_extract(metadata, '$.project') as project,
+                COUNT(*) as conv_count,
+                SUM(message_count) as msg_count,
+                MAX(created_at) as last_active
+            FROM conversations
+            WHERE metadata != '{}'
+            GROUP BY project
+            ORDER BY conv_count DESC
+        """).fetchall()
+
+        if not rows:
+            return "无项目数据"
+
+        lines = [f"共 {len(rows)} 个项目:"]
+        for r in rows:
+            lines.append(f"- {r['project']}  ({r['conv_count']} 对话, {r['msg_count']} 消息, 最近: {r['last_active']})")
+        return _text(lines)
+    finally:
+        conn.close()
+
+
+# ── memory_search_global: 全局搜索 ────────────────────
+
+@mcp.tool(annotations=READ_ONLY)
+def memory_search_global(
+    query: str,
+    mode: str = "keyword",
+    source: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    scope: str = "chunks",
+    time_decay: float = 0.05,
+    top_k: int = 10,
+) -> str:
+    """全局搜索所有项目的对话记忆。当需要跨项目搜索或不确定项目时使用。
+    mode: keyword(FTS5)/semantic(向量,需GPU)。
+    source: 过滤平台(claude/gemini/gpt/workbuddy/claude_code)。
+    date_from/date_to: 日期范围(YYYY-MM-DD)。
+    scope: segments/chunks。
+    time_decay: 时间衰减因子(0=关闭, 0.05=默认约20天半衰期)。
+    """
+    conn = _conn()
+    try:
+        if mode == "semantic":
+            return _search_semantic(conn, query, source, date_from, date_to,
+                                    scope, time_decay, top_k, exclude_current=False)
+        else:
+            return _search_keyword(conn, query, source, date_from, date_to,
+                                   scope, time_decay, top_k, exclude_current=False,
+                                   project="")
     finally:
         conn.close()
 
