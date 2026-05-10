@@ -49,6 +49,8 @@ claude mcp add rolling-memory -- uvx mcp-rolling-memory
 
 **添加后需要完全退出 Claude Code 再重新打开**，不是新开对话，是退出应用本身。重新打开后运行 `/mcp` 检查是否显示 rolling-memory。
 
+**注意**：配置必须通过 `claude mcp add` 命令添加（写入 `~/.claude.json`），不要手动创建 `.mcp.json` 文件，否则 Claude Code 无法识别。
+
 ### 其他 MCP 客户端（Cursor / Windsurf 等）
 
 ```json
