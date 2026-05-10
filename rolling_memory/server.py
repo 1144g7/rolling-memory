@@ -222,7 +222,7 @@ def _search_semantic(conn, query, source, date_from, date_to,
         import numpy as np
         from rolling_memory.embedding import get_embedding
     except ImportError:
-        return "语义搜索需要 numpy + BGE-M3 模型，请用 mode=keyword"
+        return "语义搜索(P2)需要 BGE-M3 模型，请先用 mode=keyword。P2 正在整理中，敬请期待。"
 
     bge = get_embedding()
     q_vec = bge.encode([query])[0]
@@ -363,7 +363,7 @@ def memory_relations(segment_id: int = None, conv_id: str = None,
                 lines.append(f"- {r['from_name']}(seg#{r['from_idx']}) --[{r['rel_type']}]--> {r['to_name']}(seg#{r['to_idx']})")
             return _text(lines)
         except sqlite3.OperationalError:
-            return "关系数据不可用（需要引擎索引 P3）"
+            return "关系数据不可用。P3（段落索引+关系链）正在整理中，敬请期待。"
     finally:
         conn.close()
 
@@ -413,7 +413,7 @@ def memory_detail(segment_id: int) -> str:
                 lines.append("无关系")
             return _text(lines)
         except sqlite3.OperationalError:
-            return "段详情不可用（需要引擎索引 P3）"
+            return "段详情不可用。P3（段落索引+摘要+关系链）正在整理中，敬请期待。"
     finally:
         conn.close()
 
@@ -555,7 +555,7 @@ def memory_timeline(date: str = "", app_name: str = "",
                 LIMIT ?
             """, params + [limit]).fetchall()
         except sqlite3.OperationalError:
-            return "屏幕时间线不可用（需要感知引擎采集数据）"
+            return "屏幕时间线不可用（需要感知引擎采集数据）。P3 正在整理中，敬请期待。"
 
         lines = [f"最近 {len(rows)} 条屏幕事件:"]
         for r in rows:
