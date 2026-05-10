@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-rolling-memory"
+version = "0.1.0"
+description = "对话记忆搜索 MCP Server — 自动导入 Claude Code / WorkBuddy 对话，FTS5 全文搜索，开箱即用"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Rolling Memory Contributors"},
+]
+keywords = ["mcp", "memory", "search", "claude", "conversation", "rag"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Desktop Environment",
+]
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+semantic = [
+    "numpy",
+    "FlagEmbedding",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+rolling-memory = "rolling_memory.server:main"
+
+[tool.setuptools.packages.find]
+include = ["rolling_memory*"]
