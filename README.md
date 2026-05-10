@@ -29,6 +29,14 @@
 
 ### Claude Code（推荐）
 
+先安装包：
+
+```bash
+pip install mcp-rolling-memory
+```
+
+然后用 Claude Code 命令注册：
+
 ```bash
 claude mcp add rolling-memory -- python -m rolling_memory.server
 ```
@@ -38,6 +46,8 @@ claude mcp add rolling-memory -- python -m rolling_memory.server
 ```bash
 claude mcp add rolling-memory -- uvx mcp-rolling-memory
 ```
+
+**添加后需要完全退出 Claude Code 再重新打开**，不是新开对话，是退出应用本身。重新打开后运行 `/mcp` 检查是否显示 rolling-memory。
 
 ### 其他 MCP 客户端（Cursor / Windsurf 等）
 
