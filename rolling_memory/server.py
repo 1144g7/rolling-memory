@@ -38,6 +38,35 @@ mcp = FastMCP(
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
+# 当前活跃的 CC 会话（搜索时自动排除）
+_active_cc_conv: str | None = None
+
+
+def _detect_active_session():
+    """检测当前正在进行的 Claude Code 会话，搜索时排除"""
+    global _active_cc_conv
+    cc_dir = Path.home() / ".claude" / "projects"
+    if not cc_dir.exists():
+        return
+
+    latest_file = None
+    latest_mtime = 0
+    for project_dir in cc_dir.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            try:
+                mtime = jsonl_file.stat().st_mtime
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_file = jsonl_file
+            except OSError:
+                continue
+
+    if latest_file:
+        _active_cc_conv = f"cc_{latest_file.stem}"
+        _log(f"当前活跃会话: {_active_cc_conv}，搜索时自动排除")
+
 
 def _text(lines: list[str]) -> str:
     return "\n".join(lines)
@@ -76,7 +105,8 @@ def _apply_time_decay(scored: list, decay: float) -> list:
 # ── 过滤器构建 ─────────────────────────────────────────
 
 def _build_filters(source: str, date_from: str, date_to: str,
-                   table_prefix: str = "c") -> tuple[str, list]:
+                   table_prefix: str = "c",
+                   exclude_conv: str = "") -> tuple[str, list]:
     filters = []
     params = []
     if source:
@@ -88,6 +118,9 @@ def _build_filters(source: str, date_from: str, date_to: str,
     if date_to:
         filters.append(f"{table_prefix}.created_at <= ?")
         params.append(date_to + "T99")
+    if exclude_conv:
+        filters.append(f"{table_prefix}.id != ?")
+        params.append(exclude_conv)
     where = ""
     if filters:
         where = "AND " + " AND ".join(filters)
@@ -106,6 +139,7 @@ def memory_search(
     scope: str = "segments",
     time_decay: float = 0.05,
     top_k: int = 10,
+    exclude_current: bool = True,
 ) -> str:
     """搜索对话记忆。
     mode: keyword(FTS5)/semantic(向量,需GPU)。
@@ -113,21 +147,24 @@ def memory_search(
     date_from/date_to: 日期范围(YYYY-MM-DD)。
     scope: segments/chunks。
     time_decay: 时间衰减因子(0=关闭, 0.05=默认约20天半衰期)。
+    exclude_current: 排除当前活跃的 Claude Code 会话(默认true)。
     """
     conn = _conn()
     try:
         if mode == "semantic":
             return _search_semantic(conn, query, source, date_from, date_to,
-                                    scope, time_decay, top_k)
+                                    scope, time_decay, top_k, exclude_current)
         else:
             return _search_keyword(conn, query, source, date_from, date_to,
-                                   scope, time_decay, top_k)
+                                   scope, time_decay, top_k, exclude_current)
     finally:
         conn.close()
 
 
 def _search_keyword(conn, query, source, date_from, date_to,
-                    scope, time_decay, top_k) -> str:
+                    scope, time_decay, top_k, exclude_current=True) -> str:
+    exclude = _active_cc_conv if exclude_current else ""
+
     if " " in query or "-" in query or "." in query:
         fts_query = f'"{query}"'
     else:
@@ -135,10 +172,12 @@ def _search_keyword(conn, query, source, date_from, date_to,
 
     if scope == "chunks":
         return _search_keyword_chunks(conn, fts_query, query, source,
-                                      date_from, date_to, time_decay, top_k)
+                                      date_from, date_to, time_decay, top_k,
+                                      exclude_conv=exclude)
 
     # 尝试 segments 级搜索（P3，需要 conv_segments 表）
-    where, params = _build_filters(source, date_from, date_to, table_prefix="ci")
+    where, params = _build_filters(source, date_from, date_to, table_prefix="ci",
+                                   exclude_conv=exclude)
     try:
         sql = f"""
             SELECT cs.id, cs.conv_id, cs.seg_idx, cs.name, cs.summary,
@@ -155,7 +194,8 @@ def _search_keyword(conn, query, source, date_from, date_to,
         rows = conn.execute(sql, [fts_query] + params + [top_k * 3]).fetchall()
     except sqlite3.OperationalError:
         return _search_keyword_chunks(conn, fts_query, query, source,
-                                      date_from, date_to, time_decay, top_k)
+                                      date_from, date_to, time_decay, top_k,
+                                      exclude_conv=exclude)
 
     if not rows:
         return f"未找到 '{query}'"
@@ -176,9 +216,11 @@ def _search_keyword(conn, query, source, date_from, date_to,
 
 
 def _search_keyword_chunks(conn, fts_query, query, source, date_from,
-                           date_to, time_decay, top_k) -> str:
+                           date_to, time_decay, top_k,
+                           exclude_conv: str = "") -> str:
     """搜原始对话消息"""
-    where, params = _build_filters(source, date_from, date_to)
+    where, params = _build_filters(source, date_from, date_to,
+                                   exclude_conv=exclude_conv)
 
     try:
         sql = f"""
@@ -217,7 +259,7 @@ def _search_keyword_chunks(conn, fts_query, query, source, date_from,
 
 
 def _search_semantic(conn, query, source, date_from, date_to,
-                     scope, time_decay, top_k) -> str:
+                     scope, time_decay, top_k, exclude_current=True) -> str:
     try:
         import numpy as np
         from rolling_memory.embedding import get_embedding
@@ -889,6 +931,7 @@ def _ensure_db():
 
 def main():
     _ensure_db()
+    _detect_active_session()
     mcp.run(transport="stdio")
 
 
