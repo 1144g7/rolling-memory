@@ -27,31 +27,24 @@
 
 ## 安装
 
-### Claude Code（推荐）
+### 方式一：Claude Code + uvx（最简单，推荐）
 
-先安装包：
-
-```bash
-pip install mcp-rolling-memory
-```
-
-然后用 Claude Code 命令注册：
-
-```bash
-claude mcp add rolling-memory -- python -m rolling_memory.server
-```
-
-或者一行用 uvx（无需 pip install）：
+一行搞定，无需 pip install：
 
 ```bash
 claude mcp add rolling-memory -- uvx mcp-rolling-memory
 ```
 
-**添加后需要完全退出 Claude Code 再重新打开**，不是新开对话，是退出应用本身。重新打开后运行 `/mcp` 检查是否显示 rolling-memory。
+### 方式二：Claude Code + pip install
 
-**注意**：配置必须通过 `claude mcp add` 命令添加（写入 `~/.claude.json`），不要手动创建 `.mcp.json` 文件，否则 Claude Code 无法识别。
+```bash
+pip install mcp-rolling-memory
+claude mcp add rolling-memory -- python -m rolling_memory.server
+```
 
-### 其他 MCP 客户端（Cursor / Windsurf 等）
+### 方式三：其他 MCP 客户端（Cursor / Windsurf 等）
+
+在客户端的 MCP 配置中添加：
 
 ```json
 {
@@ -64,7 +57,7 @@ claude mcp add rolling-memory -- uvx mcp-rolling-memory
 }
 ```
 
-### 从源码
+### 方式四：从源码
 
 ```bash
 git clone https://github.com/1144g7/rolling-memory.git
@@ -72,6 +65,12 @@ cd rolling-memory
 pip install -e .
 claude mcp add rolling-memory -- python -m rolling_memory.server
 ```
+
+## 注意事项
+
+- `claude mcp add` 会把配置写入 `~/.claude.json`，**不要手动创建 `.mcp.json` 文件**，Claude Code 无法识别
+- 添加后需要**完全退出 Claude Code 再重新打开**（不是新开对话，是退出应用本身）
+- 重新打开后运行 `/mcp` 检查是否显示 rolling-memory
 
 ## 首次启动
 
