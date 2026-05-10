@@ -6,11 +6,13 @@
 
 ## 功能
 
-**8 个 MCP 工具，开箱即用：**
+**10 个 MCP 工具，开箱即用：**
 
 | 工具 | 功能 |
 |------|------|
-| `memory_search` | 搜索对话（关键词 / 语义） |
+| `memory_search` | 搜当前项目对话（关键词 / 语义） |
+| `memory_search_global` | 全局搜索所有项目对话 |
+| `memory_projects` | 列出所有项目及对话数量 |
 | `memory_recent` | 最近对话活动 |
 | `memory_segments` | 对话段列表 |
 | `memory_relations` | 段间关系链 |
