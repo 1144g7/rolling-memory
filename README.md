@@ -22,30 +22,24 @@
 | 阶段 | 能力 | 条件 |
 |------|------|------|
 | P1 | FTS5 关键词搜索 + 时间过滤 + 最近活动 | 默认，开箱即用 |
-| P2 | BGE-M3 语义搜索 | 需要 GPU + `pip install mcp-rolling-memory[semantic]` |
-| P3 | 段落级搜索 + 摘要 + 关系链 | 需要感知引擎跑完索引 |
+| P2 | BGE-M3 语义搜索 | 需要 GPU + `pip install mcp-rolling-memory[semantic]`（正在整理中） |
+| P3 | 段落级搜索 + 摘要 + 关系链 | 需要感知引擎跑完索引（正在整理中） |
 
-## 快速安装
+## 安装
 
-### 方式一：pip install（推荐）
+### Claude Code（推荐）
 
 ```bash
-pip install mcp-rolling-memory
+claude mcp add rolling-memory -- python -m rolling_memory.server
 ```
 
-然后在 Claude Code 的 `.mcp.json` 中配置：
+或者一行用 uvx（无需 pip install）：
 
-```json
-{
-  "mcpServers": {
-    "rolling-memory": {
-      "command": "rolling-memory"
-    }
-  }
-}
+```bash
+claude mcp add rolling-memory -- uvx mcp-rolling-memory
 ```
 
-### 方式二：uvx（无需安装）
+### 其他 MCP 客户端（Cursor / Windsurf 等）
 
 ```json
 {
@@ -58,23 +52,13 @@ pip install mcp-rolling-memory
 }
 ```
 
-### 方式三：从源码
+### 从源码
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rolling-memory.git
+git clone https://github.com/1144g7/rolling-memory.git
 cd rolling-memory
 pip install -e .
-```
-
-```json
-{
-  "mcpServers": {
-    "rolling-memory": {
-      "command": "python",
-      "args": ["-m", "rolling_memory.server"]
-    }
-  }
-}
+claude mcp add rolling-memory -- python -m rolling_memory.server
 ```
 
 ## 首次启动
