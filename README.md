@@ -39,6 +39,8 @@
 claude mcp add rolling-memory -- uvx mcp-rolling-memory
 ```
 
+> `uvx mcp-rolling-memory` 会自动拉取 PyPI 包并运行。如果报找不到命令，改用方式二。
+
 ### 方式二：Claude Code + pip install
 
 ```bash
@@ -78,14 +80,15 @@ claude mcp add rolling-memory -- python -m rolling_memory.server
 
 ## 首次启动
 
-MCP Server 首次启动时会自动：
+MCP Server 启动后**立即就绪**（秒级），后台线程自动完成：
 
 1. 创建 SQLite 数据库（`~/.rolling-memory/memory.db`）
 2. 扫描 `~/.claude/projects/` 下的 Claude Code 对话
 3. 扫描 `~/.workbuddy/projects/` 下的 WorkBuddy 对话
 4. 建立 FTS5 全文索引
+5. 每 30 秒检查新对话并增量导入
 
-整个过程无需手动操作，通常几秒钟完成。
+首次全量扫描通常几秒钟完成。之后增量扫描只导入新对话，无新数据时几乎零开销。
 
 ## 使用示例
 

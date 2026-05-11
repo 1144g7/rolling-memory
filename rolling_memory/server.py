@@ -14,6 +14,8 @@ import os
 import re
 import sqlite3
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -805,6 +807,9 @@ def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
             if not project_dir.is_dir():
                 continue
             for jsonl_file in sorted(project_dir.glob("*.jsonl")):
+                # 跳过 Branch Agent / sidechain 会话（工具执行输出，非真实对话）
+                if source_name == "claude_code" and _is_sidechain(jsonl_file):
+                    continue
                 try:
                     messages = _parse_jsonl(jsonl_file, source_name)
                 except Exception as e:
@@ -866,6 +871,25 @@ def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
 
 
 # ── JSONL 解析器 ──────────────────────────────────────
+
+def _is_sidechain(jsonl_path: Path) -> bool:
+    """检测是否为 Branch Agent 会话（sidechain），应跳过"""
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line.strip())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if obj.get("isSidechain") is True:
+                    return True
+                # 找到第一条有效消息还没标记 sidechain，说明是主线
+                if obj.get("type") in ("user", "assistant"):
+                    return False
+    except Exception:
+        pass
+    return False
+
 
 def _parse_jsonl(path: Path, source: str) -> list[dict]:
     messages = []
@@ -974,46 +998,69 @@ def _parse_wb_line(obj: dict) -> dict | None:
 
 # ── 入口 ──────────────────────────────────────────────
 
-def _ensure_db():
-    """确保数据库存在且有数据"""
-    db_path = Path(DB_PATH)
+SCAN_INTERVAL = 30  # 增量扫描间隔（秒）
+_bg_thread: threading.Thread | None = None
 
-    if not db_path.exists():
-        _log("首次启动：创建数据库 + 扫描数据目录...")
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA journal_mode=wal")
-        _init_db(conn)
-        stats = _scan_data_dirs(conn)
-        _rebuild_fts(conn)
-        conn.close()
-        _log(f"完成: CC={stats['claude_code']} WB={stats['workbuddy']} 消息={stats['messages']}")
-    else:
-        conn = sqlite3.connect(str(db_path))
+
+def _ensure_db_ready():
+    """确保数据库文件和表结构存在（不扫描数据，秒级完成）"""
+    db_path = Path(DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=wal")
+    _init_db(conn)
+    conn.close()
+
+
+def _bg_scan_loop():
+    """后台线程：首次全量扫描 + 之后每 SCAN_INTERVAL 秒增量扫描"""
+    # 首次全量扫描
+    conn = sqlite3.connect(str(db_path := DB_PATH))
+    conn.execute("PRAGMA journal_mode=wal")
+    try:
         count = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-        has_fts = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'").fetchone()
-        conn.close()
         if count == 0:
-            _log("数据库为空，扫描数据目录...")
-            conn = sqlite3.connect(str(db_path))
-            conn.execute("PRAGMA journal_mode=wal")
-            _init_db(conn)
+            _log("首次扫描数据目录...")
             stats = _scan_data_dirs(conn)
             _rebuild_fts(conn)
-            conn.close()
-            _log(f"完成: CC={stats['claude_code']} WB={stats['workbuddy']} 消息={stats['messages']}")
-        elif not has_fts:
-            _log("FTS 索引缺失，重建...")
+            _log(f"首次扫描完成: CC={stats['claude_code']} WB={stats['workbuddy']} 消息={stats['messages']}")
+            _detect_active_session()  # 数据有了，重新检测当前项目
+        else:
+            has_fts = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'"
+            ).fetchone()
+            if not has_fts:
+                _log("FTS 索引缺失，重建...")
+                _rebuild_fts(conn)
+    finally:
+        conn.close()
+
+    # 定期增量扫描
+    while True:
+        time.sleep(SCAN_INTERVAL)
+        try:
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=wal")
-            _init_db(conn)
-            _rebuild_fts(conn)
+            stats = _scan_data_dirs(conn)
+            new_count = stats["claude_code"] + stats["workbuddy"]
+            if new_count > 0:
+                _rebuild_fts(conn)
+                _detect_active_session()
+                _log(f"增量扫描: +{new_count} 新对话, +{stats['messages']} 消息")
             conn.close()
+        except Exception as e:
+            _log(f"增量扫描出错: {e}")
 
 
 def main():
-    _ensure_db()
+    _ensure_db_ready()
     _detect_active_session()
+
+    # 启动后台扫描线程（daemon，主线程退出时自动终止）
+    global _bg_thread
+    _bg_thread = threading.Thread(target=_bg_scan_loop, daemon=True)
+    _bg_thread.start()
+
     mcp.run(transport="stdio")
 
 
