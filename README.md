@@ -1,6 +1,6 @@
 # Rolling Memory
 
-对话记忆搜索 MCP Server。自动导入你的 Claude Code 和 WorkBuddy 对话历史，FTS5 全文搜索，零配置。
+对话记忆搜索 MCP Server。自动导入你的 Claude Code、WorkBuddy 和 Pi 对话历史，FTS5 全文搜索，零配置。
 
 > 背后的算法思想 → [Rolling RAG](https://github.com/1144g7/rolling-rag)：从两张截图到一套完整的对话记忆系统
 
@@ -110,6 +110,7 @@ MCP Server 启动后**立即就绪**（秒级），后台线程自动完成：
 |--------|------|------|
 | Claude Code | `~/.claude/projects/` | 自动扫描 |
 | WorkBuddy | `~/.workbuddy/projects/` | 自动扫描 |
+| Pi | `~/.pi/agent/sessions/` | 自动扫描 |
 
 ## 依赖
 

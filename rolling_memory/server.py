@@ -35,7 +35,7 @@ RECENCY_WEIGHT = 0.3
 
 mcp = FastMCP(
     name="rolling-memory",
-    instructions="对话记忆搜索。自动导入 Claude Code 和 WorkBuddy 对话历史。",
+    instructions="对话记忆搜索。自动导入 Claude Code、WorkBuddy 和 Pi 对话历史。",
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
@@ -47,30 +47,50 @@ _current_project: str = ""
 
 
 def _detect_active_session():
-    """检测当前正在进行的 Claude Code 会话和项目"""
+    """检测当前正在进行的会话和项目（Claude Code / Pi）"""
     global _active_cc_conv, _current_project
-    cc_dir = Path.home() / ".claude" / "projects"
-    if not cc_dir.exists():
-        return
 
     latest_file = None
     latest_mtime = 0
     latest_project = ""
-    for project_dir in cc_dir.iterdir():
-        if not project_dir.is_dir():
-            continue
-        for jsonl_file in project_dir.glob("*.jsonl"):
-            try:
-                mtime = jsonl_file.stat().st_mtime
-                if mtime > latest_mtime:
-                    latest_mtime = mtime
-                    latest_file = jsonl_file
-                    latest_project = project_dir.name
-            except OSError:
+    latest_prefix = ""
+
+    # Claude Code
+    cc_dir = Path.home() / ".claude" / "projects"
+    if cc_dir.exists():
+        for project_dir in cc_dir.iterdir():
+            if not project_dir.is_dir():
                 continue
+            for jsonl_file in project_dir.glob("*.jsonl"):
+                try:
+                    mtime = jsonl_file.stat().st_mtime
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+                        latest_file = jsonl_file
+                        latest_project = project_dir.name
+                        latest_prefix = "cc_"
+                except OSError:
+                    continue
+
+    # Pi
+    pi_dir = Path.home() / ".pi" / "agent" / "sessions"
+    if pi_dir.exists():
+        for project_dir in pi_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            for jsonl_file in project_dir.glob("*.jsonl"):
+                try:
+                    mtime = jsonl_file.stat().st_mtime
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+                        latest_file = jsonl_file
+                        latest_project = project_dir.name
+                        latest_prefix = "pi_"
+                except OSError:
+                    continue
 
     if latest_file:
-        _active_cc_conv = f"cc_{latest_file.stem}"
+        _active_cc_conv = f"{latest_prefix}{latest_file.stem}"
         _current_project = latest_project
         _log(f"当前项目: {_current_project}, 活跃会话: {_active_cc_conv}")
 
@@ -784,7 +804,7 @@ def _rebuild_fts(conn: sqlite3.Connection):
 
 
 def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
-    stats = {"claude_code": 0, "workbuddy": 0, "messages": 0}
+    stats = {"claude_code": 0, "workbuddy": 0, "pi": 0, "messages": 0}
 
     sources = {
         "claude_code": {
@@ -794,6 +814,10 @@ def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
         "workbuddy": {
             "dir": Path.home() / ".workbuddy" / "projects",
             "prefix": "wb_",
+        },
+        "pi": {
+            "dir": Path.home() / ".pi" / "agent" / "sessions",
+            "prefix": "pi_",
         },
     }
 
@@ -902,12 +926,67 @@ def _parse_jsonl(path: Path, source: str) -> list[dict]:
 
             if source == "claude_code":
                 msg = _parse_cc_line(obj)
+            elif source == "pi":
+                msg = _parse_pi_line(obj)
             else:
                 msg = _parse_wb_line(obj)
 
             if msg and len(msg["text"].strip()) >= 5:
                 messages.append(msg)
     return messages
+
+
+def _parse_pi_line(obj: dict) -> dict | None:
+    """解析 Pi session JSONL 行"""
+    if obj.get("type") != "message":
+        return None
+    msg = obj.get("message", {})
+    if not msg:
+        return None
+
+    role = msg.get("role", "")
+    if role not in ("user", "assistant"):
+        return None
+
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type", "")
+            if t == "thinking":
+                continue
+            text_val = item.get("text", "")
+            if text_val:
+                parts.append(text_val.strip())
+            elif t == "tool_use":
+                name = item.get("name", "")
+                inp = item.get("input", {})
+                if name:
+                    parts.append(f"[Tool: {name}] {json.dumps(inp, ensure_ascii=False)[:500]}")
+            elif t == "tool_result":
+                inner = item.get("content", "")
+                if isinstance(inner, str) and inner:
+                    parts.append(f"[Tool Result] {inner[:500]}")
+                elif isinstance(inner, list):
+                    for sub in inner:
+                        if isinstance(sub, dict) and sub.get("text"):
+                            parts.append(f"[Tool Result] {sub['text'][:500]}")
+        text = "\n".join(p for p in parts if p)
+    else:
+        return None
+
+    if not text:
+        return None
+
+    ts = msg.get("timestamp", obj.get("timestamp", ""))
+    if isinstance(ts, (int, float)):
+        ts = datetime.fromtimestamp(ts / 1000).isoformat()
+
+    return {"sender": "human" if role == "user" else "assistant", "text": text.strip(), "created_at": ts}
 
 
 def _parse_cc_line(obj: dict) -> dict | None:
@@ -1023,7 +1102,7 @@ def _bg_scan_loop():
             _log("首次扫描数据目录...")
             stats = _scan_data_dirs(conn)
             _rebuild_fts(conn)
-            _log(f"首次扫描完成: CC={stats['claude_code']} WB={stats['workbuddy']} 消息={stats['messages']}")
+            _log(f"首次扫描完成: CC={stats['claude_code']} WB={stats['workbuddy']} PI={stats['pi']} 消息={stats['messages']}")
             _detect_active_session()  # 数据有了，重新检测当前项目
         else:
             has_fts = conn.execute(
