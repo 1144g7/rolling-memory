@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-rolling-memory"
-version = "0.1.4"
-description = "对话记忆搜索 MCP Server — 自动导入 Claude Code / WorkBuddy / Pi 对话，FTS5 全文搜索，开箱即用"
+version = "0.2.0"
+description = "对话记忆搜索 MCP Server — 自动导入 Claude Code / WorkBuddy / Pi 对话，FTS5 全文搜索 + BGE-M3 语义搜索，开箱即用"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

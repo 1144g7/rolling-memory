@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -32,6 +33,12 @@ DB_PATH = os.environ.get(
 DECAY_FACTOR = 0.05
 BASE_WEIGHT = 0.7
 RECENCY_WEIGHT = 0.3
+
+# P2: Embed 配置
+EMBED_BATCH = int(os.environ.get("ROLLING_MEMORY_EMBED_BATCH", "50"))
+EMBED_INTERVAL = int(os.environ.get("ROLLING_MEMORY_EMBED_INTERVAL", "3600"))
+AUTO_EMBED = os.environ.get("ROLLING_MEMORY_AUTO_EMBED", "1") == "1"
+KEEP_MODEL = os.environ.get("ROLLING_MEMORY_KEEP_MODEL", "0") == "1"
 
 mcp = FastMCP(
     name="rolling-memory",
@@ -550,6 +557,17 @@ def memory_stats() -> str:
         ).fetchall():
             lines.append(f"  {r['name']}  ({r['source_type']}, {r['created_at']})")
 
+        # P2 向量状态
+        try:
+            embed_count = conn.execute("SELECT count(*) FROM message_embeddings").fetchone()[0]
+            total_msgs = conn.execute("SELECT count(*) FROM conversation_messages").fetchone()[0]
+            unembedded = total_msgs - embed_count
+            lines.append(f"\n向量: {embed_count}/{total_msgs} 条消息已嵌入")
+            if unembedded > 0:
+                lines.append(f"  {unembedded} 条消息未嵌入，调用 memory_embed 启用语义搜索")
+        except sqlite3.OperationalError:
+            pass
+
         return _text(lines)
     finally:
         conn.close()
@@ -692,6 +710,250 @@ def memory_query(sql: str, limit: int = 50) -> str:
         conn.close()
 
 
+# ── memory_embed: 生成向量 ────────────────────────────
+
+def _get_unembedded_ids(conn: sqlite3.Connection, limit: int = 500) -> list[str]:
+    """获取未嵌入的消息 ID 列表"""
+    rows = conn.execute("""
+        SELECT msg.id FROM conversation_messages msg
+        LEFT JOIN message_embeddings me ON me.message_id = msg.id
+        WHERE me.message_id IS NULL AND LENGTH(msg.text) >= 10
+        ORDER BY msg.created_at DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _chunk_text(text: str, max_tokens: int = 2000) -> list[str]:
+    """将长文本按大致 token 数切分。短文本直接返回。"""
+    # 粗估: 1 token ≈ 2 字符（中英文混合）
+    max_chars = max_tokens * 2
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    # 按段落切分
+    paragraphs = text.split("\n\n")
+    current = ""
+    for para in paragraphs:
+        if len(current) + len(para) + 2 > max_chars and current:
+            chunks.append(current.strip())
+            current = para
+        else:
+            current = current + "\n\n" + para if current else para
+    if current.strip():
+        chunks.append(current.strip())
+    # 还是太长的段落，硬切
+    final = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            final.append(chunk)
+        else:
+            for i in range(0, len(chunk), max_chars):
+                final.append(chunk[i:i + max_chars])
+    return final
+
+
+@mcp.tool()
+def memory_embed(
+    batch_size: int = 0,
+    max_items: int = 0,
+) -> str:
+    """为未嵌入的消息生成 dense 向量，启用语义搜索。
+    会临时占用 GPU，完成后自动释放。首次调用时会说明配置选项。
+    batch_size: 每批编码条数（默认24）。max_items: 最多处理条数（默认全部）。"""
+    conn = _conn()
+    try:
+        unembedded_ids = _get_unembedded_ids(conn, limit=5000)
+        if not unembedded_ids:
+            return "所有消息已嵌入，无需处理。"
+
+        total = len(unembedded_ids)
+        if max_items > 0:
+            unembedded_ids = unembedded_ids[:max_items]
+
+        # 首次提示
+        if total > 50:
+            lines = [
+                f"发现 {total} 条新消息需要生成向量（启用语义搜索）。",
+                f"本次处理 {len(unembedded_ids)} 条，预计 GPU 占用约 {max(1, len(unembedded_ids) // 24)} 分钟。",
+                "",
+                "可选模式：",
+                "  立即运行 — 一次性跑完",
+                "  自动模式 — 每累积 50 条新消息触发，1小时间隔",
+                "  仅手动 — 需要时再调用",
+                "",
+                "以上参数均可调整。你可以帮用户选择合适的模式。",
+                "",
+                "开始处理...",
+            ]
+            _log(f"开始嵌入 {len(unembedded_ids)} 条消息")
+
+        # 加载模型
+        from rolling_memory.embedding import get_engine
+        engine = get_engine()
+
+        processed = 0
+        batch_texts = []
+        batch_ids = []
+        batch_chunks = []  # (msg_id, chunk_idx, text)
+
+        # 准备数据：长文本切 chunk
+        placeholders = ",".join("?" * len(unembedded_ids))
+        rows = conn.execute(
+            f"SELECT id, text FROM conversation_messages WHERE id IN ({placeholders})",
+            unembedded_ids
+        ).fetchall()
+
+        for r in rows:
+            chunks = _chunk_text(r["text"])
+            for ci, chunk in enumerate(chunks):
+                batch_chunks.append((r["id"], ci, chunk))
+
+        _log(f"共 {len(batch_chunks)} 个 chunk 待编码")
+
+        bs = batch_size if batch_size > 0 else 24
+        for msg_id, chunk_idx, text in batch_chunks:
+            batch_texts.append(text)
+            batch_ids.append((msg_id, chunk_idx))
+
+            if len(batch_texts) >= bs:
+                vecs = engine.encode_dense(batch_texts, batch_size=bs)
+                for (mid, ci), vec in zip(batch_ids, vecs):
+                    blob = engine.vec_to_blob(vec)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
+                        (f"{mid}_{ci}", mid.rsplit("_", 1)[0] if "_" in mid else mid, blob, ci, len(batch_texts[0]))
+                    )
+                conn.commit()
+                processed += len(batch_texts)
+                batch_texts = []
+                batch_ids = []
+
+        # 处理剩余
+        if batch_texts:
+            vecs = engine.encode_dense(batch_texts, batch_size=bs)
+            for (mid, ci), vec in zip(batch_ids, vecs):
+                blob = engine.vec_to_blob(vec)
+                conn.execute(
+                    "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
+                    (f"{mid}_{ci}", mid.rsplit("_", 1)[0] if "_" in mid else mid, blob, ci, len(batch_texts[0]))
+                )
+            conn.commit()
+            processed += len(batch_texts)
+
+        # 卸载模型
+        if not KEEP_MODEL:
+            engine.unload()
+
+        _log(f"嵌入完成: {processed} 个 chunk")
+        return f"完成。已为 {processed} 个文本片段生成向量。{'自动模式已启用。' if AUTO_EMBED else ''}"
+
+    finally:
+        conn.close()
+
+
+# ── memory_search_vectors: 向量搜索 ───────────────────
+
+@mcp.tool(annotations=READ_ONLY)
+def memory_search_vectors(
+    query: str,
+    top_k: int = 10,
+    rerank: bool = False,
+    source: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    project: str = "current",
+    time_decay: float = 0.05,
+) -> str:
+    """语义搜索对话消息（向量检索）。
+    query: 搜索词。top_k: 返回条数。rerank: 启用 ColBERT 精排（更准但稍慢）。
+    source: 过滤平台。date_from/date_to: 日期范围(YYYY-MM-DD)。
+    project: 项目名(默认"current")。"""
+    conn = _conn()
+    try:
+        # 检查是否有向量数据
+        embed_count = conn.execute("SELECT count(*) FROM message_embeddings").fetchone()[0]
+        if embed_count == 0:
+            return "无向量数据。请先调用 memory_embed 生成向量。"
+
+        # 过滤条件
+        where, params = _build_filters(source, date_from, date_to, table_prefix="c")
+        proj = _current_project if project == "current" else project
+        proj_where, proj_params = _project_where(proj)
+        where += proj_where
+        params += proj_params
+
+        from rolling_memory.embedding import get_engine
+        engine = get_engine()
+
+        # 查询 dense 向量
+        q_vec = engine.encode_dense([query])[0]
+
+        # 加载所有候选向量（后续可优化为 ANN 索引）
+        rows = conn.execute(f"""
+            SELECT me.message_id, me.conversation_id, me.dense_vector, me.chunk_index,
+                   msg.text, msg.sender,
+                   c.source_type as source, c.name as conv_name, c.created_at
+            FROM message_embeddings me
+            JOIN conversation_messages msg ON msg.id = me.message_id
+            JOIN conversations c ON c.id = me.conversation_id
+            WHERE 1=1 {where}
+        """, params).fetchall()
+
+        if not rows:
+            if not KEEP_MODEL:
+                engine.unload()
+            return "无匹配结果。"
+
+        # Dense cosine 排序
+        scored = []
+        for r in rows:
+            vec = engine.blob_to_vec(r["dense_vector"])
+            score = float(np.dot(q_vec, vec))
+            scored.append((score, r))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        candidates = scored[:top_k * 5 if rerank else top_k]
+
+        # ColBERT 精排（可选）
+        if rerank and len(candidates) > top_k:
+            _log(f"ColBERT 精排: {len(candidates)} → {top_k}")
+            q_tokens = engine.encode_colbert([query])
+            doc_texts = [r["text"][:2000] for _, r in candidates]
+            doc_tokens = engine.encode_colbert(doc_texts)
+
+            reranked = []
+            for i, (score, r) in enumerate(candidates):
+                cb_score = engine.colbert_score(q_tokens[0], doc_tokens[i])
+                # 融合: 0.4 * dense + 0.6 * colbert
+                final_score = 0.4 * score + 0.6 * cb_score
+                reranked.append((final_score, r))
+            reranked.sort(key=lambda x: x[0], reverse=True)
+            candidates = reranked[:top_k]
+
+        # 时间衰减
+        if time_decay > 0:
+            candidates = _apply_time_decay(candidates, time_decay)
+
+        # 卸载模型
+        if not KEEP_MODEL:
+            engine.unload()
+
+        # 输出
+        lines = [f"语义搜索 '{query}' — 找到 {len(candidates)} 条结果:"]
+        for score, r in candidates[:top_k]:
+            if score < 0.15:
+                continue
+            lines.append(f"- [{r['sender']}] {r['conv_name']}  (score={score:.3f}, {r['source']}, {r['created_at']})")
+            lines.append(f"  {(r['text'] or '')[:300]}")
+
+        if len([l for l in lines if l.startswith("-")]) == 0:
+            return f"未找到相关结果（相似度低于阈值）。"
+        return _text(lines)
+    finally:
+        conn.close()
+
+
 # ── memory_projects: 列出项目 ─────────────────────────
 
 @mcp.tool(annotations=READ_ONLY)
@@ -791,6 +1053,16 @@ def _init_db(conn: sqlite3.Connection):
             content_rowid='rowid',
             tokenize='unicode61'
         );
+
+        -- P2: 消息级 dense 向量
+        CREATE TABLE IF NOT EXISTS message_embeddings (
+            message_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            dense_vector BLOB NOT NULL,
+            chunk_index INTEGER DEFAULT 0,
+            text_length INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_me_conv ON message_embeddings(conversation_id);
     """)
     conn.commit()
 
@@ -1091,6 +1363,81 @@ def _ensure_db_ready():
     conn.close()
 
 
+def _auto_embed_check():
+    """检查是否有足够的未嵌入消息，自动触发 embedding"""
+    if not AUTO_EMBED:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            unembedded = conn.execute("""
+                SELECT COUNT(*) FROM conversation_messages msg
+                LEFT JOIN message_embeddings me ON me.message_id = msg.id
+                WHERE me.message_id IS NULL AND LENGTH(msg.text) >= 10
+            """).fetchone()[0]
+        finally:
+            conn.close()
+
+        if unembedded >= EMBED_BATCH:
+            _log(f"自动嵌入: {unembedded} 条未嵌入消息，开始处理...")
+            # 调用 memory_embed 逻辑（在主线程外，直接调内部函数）
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                ids = _get_unembedded_ids(conn, limit=unembedded)
+                if ids:
+                    from rolling_memory.embedding import get_engine
+                    engine = get_engine()
+                    processed = 0
+                    batch_texts = []
+                    batch_meta = []
+
+                    chunks = []
+                    placeholders = ",".join("?" * len(ids))
+                    rows = conn.execute(
+                        f"SELECT id, text FROM conversation_messages WHERE id IN ({placeholders})", ids
+                    ).fetchall()
+                    for r in rows:
+                        for ci, chunk in enumerate(_chunk_text(r["text"])):
+                            chunks.append((r["id"], ci, chunk))
+
+                    for msg_id, chunk_idx, text in chunks:
+                        batch_texts.append(text)
+                        batch_meta.append((msg_id, chunk_idx))
+                        if len(batch_texts) >= 24:
+                            vecs = engine.encode_dense(batch_texts)
+                            for (mid, ci), vec in zip(batch_meta, vecs):
+                                blob = engine.vec_to_blob(vec)
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
+                                    (f"{mid}_{ci}", mid, blob, ci, len(text))
+                                )
+                            conn.commit()
+                            processed += len(batch_texts)
+                            batch_texts, batch_meta = [], []
+
+                    if batch_texts:
+                        vecs = engine.encode_dense(batch_texts)
+                        for (mid, ci), vec in zip(batch_meta, vecs):
+                            blob = engine.vec_to_blob(vec)
+                            conn.execute(
+                                "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
+                                (f"{mid}_{ci}", mid, blob, ci, len(text))
+                            )
+                        conn.commit()
+                        processed += len(batch_texts)
+
+                    if not KEEP_MODEL:
+                        engine.unload()
+                    _log(f"自动嵌入完成: {processed} 个 chunk")
+                conn.close()
+            except Exception as e:
+                _log(f"自动嵌入出错: {e}")
+    except Exception as e:
+        _log(f"嵌入检查出错: {e}")
+
+
 def _bg_scan_loop():
     """后台线程：首次全量扫描 + 之后每 SCAN_INTERVAL 秒增量扫描"""
     # 首次全量扫描
@@ -1103,7 +1450,7 @@ def _bg_scan_loop():
             stats = _scan_data_dirs(conn)
             _rebuild_fts(conn)
             _log(f"首次扫描完成: CC={stats['claude_code']} WB={stats['workbuddy']} PI={stats['pi']} 消息={stats['messages']}")
-            _detect_active_session()  # 数据有了，重新检测当前项目
+            _detect_active_session()
         else:
             has_fts = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='fts_chunks'"
@@ -1114,6 +1461,9 @@ def _bg_scan_loop():
     finally:
         conn.close()
 
+    # 首次自动嵌入检查
+    _auto_embed_check()
+
     # 定期增量扫描
     while True:
         time.sleep(SCAN_INTERVAL)
@@ -1121,11 +1471,12 @@ def _bg_scan_loop():
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=wal")
             stats = _scan_data_dirs(conn)
-            new_count = stats["claude_code"] + stats["workbuddy"]
+            new_count = stats["claude_code"] + stats["workbuddy"] + stats.get("pi", 0)
             if new_count > 0:
                 _rebuild_fts(conn)
                 _detect_active_session()
                 _log(f"增量扫描: +{new_count} 新对话, +{stats['messages']} 消息")
+                _auto_embed_check()
             conn.close()
         except Exception as e:
             _log(f"增量扫描出错: {e}")

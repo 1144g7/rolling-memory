@@ -1,23 +1,25 @@
 # Rolling Memory
 
-对话记忆搜索 MCP Server。自动导入你的 Claude Code、WorkBuddy 和 Pi 对话历史，FTS5 全文搜索，零配置。
+对话记忆搜索 MCP Server。自动导入你的 Claude Code、WorkBuddy 和 Pi 对话历史，FTS5 全文搜索 + BGE-M3 语义搜索，零配置。
 
 > 背后的算法思想 → [Rolling RAG](https://github.com/1144g7/rolling-rag)：从两张截图到一套完整的对话记忆系统
 
 ## 功能
 
-**10 个 MCP 工具，开箱即用：**
+**12 个 MCP 工具，开箱即用：**
 
 | 工具 | 功能 |
 |------|------|
 | `memory_search` | 搜当前项目对话（关键词 / 语义） |
 | `memory_search_global` | 全局搜索所有项目对话 |
+| `memory_search_vectors` | **NEW** 语义搜索（dense 向量 + 可选 ColBERT 精排） |
+| `memory_embed` | **NEW** 生成消息向量（手动 / 自动触发） |
 | `memory_projects` | 列出所有项目及对话数量 |
 | `memory_recent` | 最近对话活动 |
 | `memory_segments` | 对话段列表 |
 | `memory_relations` | 段间关系链 |
 | `memory_detail` | 段详情 + 关系 |
-| `memory_stats` | 数据统计概览 |
+| `memory_stats` | 数据统计概览（含向量状态） |
 | `memory_timeline` | 屏幕时间线 |
 | `memory_query` | 自由 SQL 查询（只读） |
 
@@ -26,8 +28,8 @@
 | 阶段 | 能力 | 条件 |
 |------|------|------|
 | P1 | FTS5 关键词搜索 + 时间过滤 + 最近活动 | 默认，开箱即用 |
-| P2 | BGE-M3 语义搜索 | 需要 GPU + `pip install mcp-rolling-memory[semantic]`（正在整理中） |
-| P3 | 段落级搜索 + 摘要 + 关系链 | 需要感知引擎跑完索引（正在整理中） |
+| P2 | BGE-M3 语义搜索 + ColBERT 精排 | 需要 GPU + `pip install mcp-rolling-memory[semantic]` |
+| P3 | 段落级搜索 + 摘要 + 关系链 | 规划中 |
 
 ## 安装
 
@@ -47,6 +49,16 @@ claude mcp add rolling-memory -- uvx mcp-rolling-memory
 pip install mcp-rolling-memory
 claude mcp add rolling-memory -- python -m rolling_memory.server
 ```
+
+### 语义搜索（P2）
+
+安装语义搜索依赖（需要 CUDA 环境）：
+
+```bash
+pip install mcp-rolling-memory[semantic]
+```
+
+首次调用 `memory_embed` 或 `memory_search_vectors` 时，会自动下载 BGE-M3 模型（约 2GB）。
 
 ### 方式三：其他 MCP 客户端（Cursor / Windsurf 等）
 
@@ -85,10 +97,20 @@ MCP Server 启动后**立即就绪**（秒级），后台线程自动完成：
 1. 创建 SQLite 数据库（`~/.rolling-memory/memory.db`）
 2. 扫描 `~/.claude/projects/` 下的 Claude Code 对话
 3. 扫描 `~/.workbuddy/projects/` 下的 WorkBuddy 对话
-4. 建立 FTS5 全文索引
-5. 每 30 秒检查新对话并增量导入
+4. 扫描 `~/.pi/agent/sessions/` 下的 Pi 对话
+5. 建立 FTS5 全文索引
+6. 每 30 秒检查新对话并增量导入
 
 首次全量扫描通常几秒钟完成。之后增量扫描只导入新对话，无新数据时几乎零开销。
+
+### 语义搜索自动触发
+
+安装 `[semantic]` 依赖后，后台线程会自动检测未嵌入的消息：
+
+- 累积 **50 条**新消息自动触发 embedding（可通过 `ROLLING_MEMORY_EMBED_BATCH` 调整）
+- 最大间隔 **1 小时**（可通过 `ROLLING_MEMORY_EMBED_INTERVAL` 调整）
+- 模型用完后**自动卸载**释放 GPU（`ROLLING_MEMORY_KEEP_MODEL=1` 可保持常驻）
+- 关闭自动：`ROLLING_MEMORY_AUTO_EMBED=0`（改为仅手动调用 `memory_embed`）
 
 ## 使用示例
 
@@ -97,6 +119,17 @@ MCP Server 启动后**立即就绪**（秒级），后台线程自动完成：
 - "我之前聊过什么关于 Python 装饰器的内容？"
 - "最近一周讨论了哪些话题？"
 - "帮我找一下之前讨论的那个数据库设计方案"
+- "用语义搜索找一下关于 AI 记忆架构的讨论"（需要 P2）
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ROLLING_MEMORY_DB` | `~/.rolling-memory/memory.db` | 数据库路径 |
+| `ROLLING_MEMORY_AUTO_EMBED` | `1` | 自动 embedding 开关（0=关闭） |
+| `ROLLING_MEMORY_EMBED_BATCH` | `50` | 自动触发阈值（条数） |
+| `ROLLING_MEMORY_EMBED_INTERVAL` | `3600` | 自动触发最大间隔（秒） |
+| `ROLLING_MEMORY_KEEP_MODEL` | `0` | 常驻 GPU（1=不卸载） |
 
 ## 数据存储
 
@@ -117,8 +150,10 @@ MCP Server 启动后**立即就绪**（秒级），后台线程自动完成：
 - Python >= 3.10
 - `mcp` (MCP Python SDK)
 
-可选：
-- `numpy` + `FlagEmbedding`（语义搜索，P2）
+可选（P2 语义搜索）：
+- `numpy`
+- `FlagEmbedding`（BGE-M3 模型，约 2GB）
+- CUDA 环境
 
 ## License
 
