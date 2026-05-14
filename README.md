@@ -6,7 +6,7 @@
 
 ## 功能
 
-**12 个 MCP 工具，开箱即用：**
+**13 个 MCP 工具，开箱即用：**
 
 | 工具 | 功能 |
 |------|------|
@@ -14,6 +14,7 @@
 | `memory_search_global` | 全局搜索所有项目对话 |
 | `memory_search_vectors` | **NEW** 语义搜索（dense 向量 + 可选 ColBERT 精排） |
 | `memory_embed` | **NEW** 生成消息向量（手动 / 自动触发） |
+| `memory_import` | **NEW** 导入网页端对话（Claude.ai / ChatGPT / Gemini） |
 | `memory_projects` | 列出所有项目及对话数量 |
 | `memory_recent` | 最近对话活动 |
 | `memory_segments` | 对话段列表 |
