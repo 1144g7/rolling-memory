@@ -10,9 +10,11 @@ FTS5 全文索引，开箱即用，零配置。
   P3 (需引擎): 段落级搜索 + 摘要 + 关系链
 """
 import json
+import hashlib
 import os
 import re
 import sqlite3
+from html.parser import HTMLParser
 import sys
 import threading
 import time
@@ -28,6 +30,10 @@ from mcp.types import ToolAnnotations
 DB_PATH = os.environ.get(
     "ROLLING_MEMORY_DB",
     str(Path.home() / ".rolling-memory" / "memory.db"),
+)
+SCAN_LOCK_PATH = os.environ.get(
+    "ROLLING_MEMORY_SCAN_LOCK",
+    str(Path(DB_PATH).with_suffix(".scan.lock")),
 )
 
 DECAY_FACTOR = 0.05
@@ -51,6 +57,7 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True)
 _active_cc_conv: str | None = None
 # 当前项目名（用于默认项目过滤）
 _current_project: str = ""
+_scan_lock_file = None
 
 
 def _detect_active_session():
@@ -115,6 +122,44 @@ def _conn() -> sqlite3.Connection:
 
 def _log(msg: str):
     print(f"[Rolling Memory] {msg}", file=sys.stderr, flush=True)
+
+
+def _try_acquire_scan_lock():
+    """Allow only one local MCP process to run the background importer."""
+    lock_path = Path(SCAN_LOCK_PATH)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "a+b")
+    if lock_path.stat().st_size == 0:
+        f.write(b"\0")
+        f.flush()
+
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            f.seek(0)
+            f.truncate()
+            f.write(str(os.getpid()).encode("ascii") + b"\n")
+            f.flush()
+            return f
+        except OSError:
+            f.close()
+            return None
+
+    import fcntl
+
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.seek(0)
+        f.truncate()
+        f.write(str(os.getpid()).encode("ascii") + b"\n")
+        f.flush()
+        return f
+    except OSError:
+        f.close()
+        return None
 
 
 # ── 时间衰减 ──────────────────────────────────────────
@@ -198,7 +243,8 @@ def memory_search(
                                     scope, time_decay, top_k, exclude_current)
         else:
             return _search_keyword(conn, query, source, date_from, date_to,
-                                   scope, time_decay, top_k, exclude_current)
+                                   scope, time_decay, top_k, exclude_current,
+                                   project)
     finally:
         conn.close()
 
@@ -1017,6 +1063,406 @@ def memory_search_global(
         conn.close()
 
 
+# ── 网页端导入（Claude.ai / ChatGPT）────────────────────
+
+def _detect_export_source(data: list) -> str:
+    """自动检测导出来源"""
+    if not data or not isinstance(data, list):
+        return "unknown"
+    first = data[0]
+    if "uuid" in first and "chat_messages" in first:
+        return "claude"
+    if "id" in first and "mapping" in first:
+        return "chatgpt"
+    return "unknown"
+
+
+def _walk_gpt_tree(mapping: dict) -> list[dict]:
+    """遍历 ChatGPT mapping 树，返回有序消息列表"""
+    root_id = None
+    for k, v in mapping.items():
+        if v.get("parent") is None:
+            root_id = k
+            break
+    if not root_id:
+        return []
+
+    messages = []
+    current = root_id
+    visited = set()
+    while current and current not in visited:
+        visited.add(current)
+        node = mapping.get(current)
+        if not node:
+            break
+
+        msg = node.get("message")
+        if msg:
+            author = msg.get("author", {})
+            author_role = author.get("role", "") if isinstance(author, dict) else ""
+            content = msg.get("content")
+
+            text = ""
+            if isinstance(content, dict):
+                parts = content.get("parts", [])
+                text = " ".join(str(p) for p in parts if p)
+            elif isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                for p in content:
+                    if isinstance(p, str):
+                        text += p
+                    elif isinstance(p, dict) and "text" in p:
+                        text += p["text"]
+
+            if author_role and text.strip():
+                sender = {
+                    "user": "human", "assistant": "assistant",
+                    "tool": "system", "system": "system",
+                }.get(author_role, author_role)
+                create_ts = msg.get("create_time")
+                messages.append({
+                    "sender": sender,
+                    "text": text.strip(),
+                    "created_at": _epoch_to_iso(create_ts) if create_ts else "",
+                })
+
+        children = node.get("children", [])
+        current = children[0] if children else None
+
+    return messages
+
+
+def _epoch_to_iso(epoch) -> str:
+    """Unix epoch float -> ISO datetime string"""
+    from datetime import timezone
+    try:
+        dt = datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _import_claude_json(conn: sqlite3.Connection, conversations: list) -> dict:
+    """导入 Claude.ai 导出的 conversations.json"""
+    imported = 0
+    skipped = 0
+    total_new_msgs = 0
+
+    for conv in conversations:
+        conv_id = f"claude_{conv['uuid']}"
+        msgs = conv.get("chat_messages", [])
+        total_chars = sum(len(m.get("text", "") or "") for m in msgs)
+
+        if total_chars < 100:
+            skipped += 1
+            continue
+
+        # 提取标题
+        conv_name = conv.get("name", "")
+
+        # 构造消息列表
+        messages = []
+        for m in msgs:
+            text = m.get("text", "") or ""
+            if not text and m.get("content"):
+                content = m["content"]
+                if isinstance(content, list):
+                    text = " ".join(
+                        c.get("text", "") for c in content
+                        if isinstance(c, dict) and c.get("text")
+                    )
+                elif isinstance(content, str):
+                    text = content
+            if not text.strip():
+                continue
+            messages.append({
+                "sender": m.get("sender", "unknown"),
+                "text": text,
+                "created_at": m.get("created_at", ""),
+                "source_id": m.get("uuid", ""),
+            })
+
+        if len(messages) < 2:
+            skipped += 1
+            continue
+
+        created = conv.get("created_at", "")
+        metadata = {"account": conv.get("account", {})}
+
+        inserted = _upsert_conversation(
+            conn,
+            conv_id=conv_id,
+            source_type="claude",
+            conv_name=conv_name,
+            messages=messages,
+            created=created,
+            metadata=metadata,
+        )
+        conn.commit()
+        if inserted > 0:
+            imported += 1
+            total_new_msgs += inserted
+
+    return {"imported": imported, "skipped": skipped, "new_messages": total_new_msgs}
+
+
+def _import_chatgpt_json(conn: sqlite3.Connection, conversations: list) -> dict:
+    """导入 ChatGPT 导出的 conversations.json"""
+    imported = 0
+    skipped = 0
+    total_new_msgs = 0
+
+    for conv in conversations:
+        conv_id = f"gpt_{conv['id']}"
+        mapping = conv.get("mapping", {})
+
+        messages = _walk_gpt_tree(mapping)
+        total_chars = sum(len(m["text"]) for m in messages)
+
+        if total_chars < 100:
+            skipped += 1
+            continue
+
+        # 提取标题
+        conv_name = conv.get("title", "")
+
+        created_ts = conv.get("create_time")
+        created = _epoch_to_iso(created_ts) if created_ts else ""
+        metadata = {"model": conv.get("default_model_slug", "")}
+
+        inserted = _upsert_conversation(
+            conn,
+            conv_id=conv_id,
+            source_type="gpt",
+            conv_name=conv_name,
+            messages=messages,
+            created=created,
+            metadata=metadata,
+        )
+        conn.commit()
+        if inserted > 0:
+            imported += 1
+            total_new_msgs += inserted
+
+    return {"imported": imported, "skipped": skipped, "new_messages": total_new_msgs}
+
+
+class _GeminiHTMLParser(HTMLParser):
+    """解析 Google Takeout Gemini HTML
+    每条 Q&A 单独提取，不做聚类。
+    结构: content-cell 里 "Prompted {用户输入} {时间戳}CST {AI回复}"
+    """
+    def __init__(self):
+        super().__init__()
+        self.entries = []
+        self._div_depth = 0
+        self._in_first_cell = False
+        self._cell_depth = 0
+        self._text_buf = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "div":
+            self._div_depth += 1
+            attrs_dict = dict(attrs)
+            cls = attrs_dict.get("class", "")
+            if "content-cell" in cls and not self._in_first_cell:
+                self._in_first_cell = True
+                self._cell_depth = self._div_depth
+                self._text_buf = ""
+
+    def handle_endtag(self, tag):
+        if tag == "div":
+            if self._in_first_cell and self._div_depth == self._cell_depth:
+                self._in_first_cell = False
+                self._parse_cell(self._text_buf)
+            self._div_depth -= 1
+
+    def handle_data(self, data):
+        if self._in_first_cell:
+            self._text_buf += " " + data
+
+    def _parse_cell(self, text: str):
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"商品：.*", "", text, flags=re.DOTALL).strip()
+        text = re.sub(r"为什么此处会显示此活动记录？.*", "", text, flags=re.DOTALL).strip()
+
+        if text.startswith("Prompted "):
+            text = text[9:]
+
+        ts_match = re.search(
+            r"(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2}):(\d{2})",
+            text,
+        )
+        if not ts_match:
+            return
+
+        user_text = text[:ts_match.start()].strip()
+        ai_text = text[ts_match.end():].strip()
+        ai_text = re.sub(r"^[A-Z]{2,4}\s*", "", ai_text).strip()
+
+        y, mo, d, h, mi, s = ts_match.groups()
+        timestamp = f"{y}-{int(mo):02d}-{int(d):02d}T{int(h):02d}:{mi}:{s}Z"
+
+        if user_text:
+            self.entries.append({
+                "user_text": user_text,
+                "ai_text": ai_text,
+                "timestamp": timestamp,
+            })
+
+
+def _import_gemini_html(conn: sqlite3.Connection, html: str) -> dict:
+    """导入 Gemini Takeout HTML，每条 Q&A 单独作为一条对话"""
+    parser = _GeminiHTMLParser()
+    parser.feed(html)
+    entries = parser.entries
+
+    imported = 0
+    skipped = 0
+    total_new_msgs = 0
+
+    for entry in entries:
+        user_text = entry["user_text"].strip()
+        ai_text = entry["ai_text"].strip()
+        timestamp = entry["timestamp"]
+
+        if len(user_text) + len(ai_text) < 50:
+            skipped += 1
+            continue
+
+        # 每条 Q&A = 一条对话，ID 基于内容哈希（稳定）
+        conv_id = f"gemini_{hashlib.sha256((user_text[:500] + timestamp).encode('utf-8', errors='ignore')).hexdigest()[:24]}"
+
+        # 标题 = 用户问题
+        conv_name = user_text[:80]
+
+        # 构造消息列表
+        messages = [
+            {"sender": "human", "text": user_text, "created_at": timestamp},
+        ]
+        if ai_text:
+            messages.append({"sender": "assistant", "text": ai_text, "created_at": timestamp})
+
+        inserted = _upsert_conversation(
+            conn,
+            conv_id=conv_id,
+            source_type="gemini",
+            conv_name=conv_name,
+            messages=messages,
+            created=timestamp,
+            metadata={"source": "google_takeout"},
+        )
+        conn.commit()
+        if inserted > 0:
+            imported += 1
+            total_new_msgs += inserted
+
+    return {"imported": imported, "skipped": skipped, "new_messages": total_new_msgs}
+
+
+@mcp.tool()
+def memory_import(path: str, source: str = "auto") -> str:
+    """导入网页端导出的对话文件。支持增量更新（重复导入只添加新消息）。
+    path: 文件路径（JSON / HTML / ZIP）
+    source: claude / chatgpt / gemini / auto（自动检测）
+    支持: Claude.ai conversations.json, ChatGPT conversations.json, Gemini Takeout HTML"""
+    import tempfile
+    import shutil
+    import zipfile
+
+    file_path = Path(path).expanduser()
+    if not file_path.exists():
+        return f"文件不存在: {path}"
+
+    # HTML 文件 → Gemini
+    if file_path.suffix.lower() in (".html", ".htm") or source == "gemini":
+        try:
+            html = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            html = file_path.read_text(encoding="utf-8", errors="ignore")
+
+        conn = _conn()
+        try:
+            result = _import_gemini_html(conn, html)
+            if result["imported"] > 0:
+                _rebuild_fts(conn)
+            lines = [
+                f"导入完成 (gemini):",
+                f"  新增: {result['imported']} 条 Q&A",
+                f"  跳过(短): {result['skipped']}",
+                f"  新增消息: {result['new_messages']}",
+            ]
+            return _text(lines)
+        finally:
+            conn.close()
+
+    # JSON / ZIP → Claude 或 ChatGPT
+    json_path = file_path
+    tmp_dir = None
+
+    if file_path.suffix.lower() == ".zip":
+        tmp_dir = tempfile.mkdtemp(prefix="rolling_import_")
+        try:
+            with zipfile.ZipFile(file_path, "r") as zf:
+                zf.extractall(tmp_dir)
+        except zipfile.BadZipFile:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            return f"无效的 ZIP 文件: {path}"
+
+        for candidate in Path(tmp_dir).rglob("conversations.json"):
+            json_path = candidate
+            break
+        else:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return f"ZIP 中未找到 conversations.json: {path}"
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return f"JSON 解析失败: {e}"
+
+    if not isinstance(data, list):
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return "文件格式错误：期望 JSON 数组"
+
+    if source == "auto":
+        source = _detect_export_source(data)
+    if source not in ("claude", "chatgpt"):
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return f"无法识别导出格式。请指定 source=claude 或 source=chatgpt"
+
+    conn = _conn()
+    try:
+        if source == "claude":
+            result = _import_claude_json(conn, data)
+        else:
+            result = _import_chatgpt_json(conn, data)
+
+        if result["imported"] > 0:
+            _rebuild_fts(conn)
+
+        total = len(data)
+        lines = [
+            f"导入完成 ({source}):",
+            f"  总对话: {total}",
+            f"  新增/更新: {result['imported']}",
+            f"  跳过(空): {result['skipped']}",
+            f"  新增消息: {result['new_messages']}",
+        ]
+        return _text(lines)
+    finally:
+        conn.close()
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ── 首次启动：自动建库 + 扫描数据 ──────────────────────
 
 def _init_db(conn: sqlite3.Connection):
@@ -1047,6 +1493,17 @@ def _init_db(conn: sqlite3.Connection):
         );
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON conversation_messages(conversation_id);
 
+        CREATE TABLE IF NOT EXISTS import_state (
+            path TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            imported_at TEXT NOT NULL,
+            metadata TEXT DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_state_source ON import_state(source_type);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
             text,
             content='conversation_messages',
@@ -1075,8 +1532,114 @@ def _rebuild_fts(conn: sqlite3.Connection):
     _log(f"FTS5 索引完成: {count} 条")
 
 
+def _file_scan_state(conn: sqlite3.Connection, path: Path) -> tuple[int, float, bool]:
+    stat = path.stat()
+    size = stat.st_size
+    mtime = stat.st_mtime
+    row = conn.execute(
+        "SELECT size, mtime FROM import_state WHERE path=?",
+        (str(path),),
+    ).fetchone()
+    unchanged = bool(row and row[0] == size and float(row[1]) == mtime)
+    return size, mtime, unchanged
+
+
+def _message_id(conv_id: str, seq: int, msg: dict) -> str:
+    source_id = msg.get("source_id")
+    if source_id:
+        return f"{conv_id}_{source_id}"
+    raw = "\x1f".join([
+        conv_id,
+        msg.get("sender", ""),
+        msg.get("created_at", ""),
+        msg.get("text", ""),
+    ])
+    digest = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:32]
+    return f"{conv_id}_{digest}"
+
+
+def _upsert_conversation(
+    conn: sqlite3.Connection,
+    *,
+    conv_id: str,
+    source_type: str,
+    conv_name: str,
+    messages: list[dict],
+    created: str,
+    metadata: dict,
+) -> int:
+    total_chars = sum(len(m["text"]) for m in messages)
+    updated = messages[-1].get("created_at", created) if messages else created
+    now = datetime.now().isoformat()
+
+    conn.execute(
+        """INSERT OR IGNORE INTO conversations
+           (id, source_type, name, summary, message_count, total_chars,
+            created_at, updated_at, imported_at, process_status, metadata)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (conv_id, source_type, conv_name, "", 0, 0, created, updated, now, "pending",
+         json.dumps(metadata, ensure_ascii=False)),
+    )
+
+    inserted = 0
+    for seq, msg in enumerate(messages):
+        existing = conn.execute(
+            """SELECT 1 FROM conversation_messages
+               WHERE conversation_id=? AND sender=? AND created_at=? AND text=?
+               LIMIT 1""",
+            (conv_id, msg["sender"], msg.get("created_at", ""), msg["text"]),
+        ).fetchone()
+        if existing:
+            continue
+
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO conversation_messages
+               (id, conversation_id, sender, text, sequence, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (_message_id(conv_id, seq, msg), conv_id, msg["sender"], msg["text"], seq, msg.get("created_at", "")),
+        )
+        inserted += cur.rowcount
+
+    message_count = conn.execute(
+        "SELECT COUNT(*) FROM conversation_messages WHERE conversation_id=?",
+        (conv_id,),
+    ).fetchone()[0]
+    conn.execute(
+        """UPDATE conversations
+           SET name=COALESCE(NULLIF(name, ''), ?),
+               message_count=?,
+               total_chars=?,
+               updated_at=?,
+               imported_at=?,
+               metadata=?
+           WHERE id=?""",
+        (conv_name, message_count, total_chars, updated, now,
+         json.dumps(metadata, ensure_ascii=False), conv_id),
+    )
+    return inserted
+
+
+def _record_import_state(
+    conn: sqlite3.Connection,
+    *,
+    path: Path,
+    source_type: str,
+    conv_id: str,
+    size: int,
+    mtime: float,
+    metadata: dict,
+):
+    conn.execute(
+        """INSERT OR REPLACE INTO import_state
+           (path, source_type, conversation_id, size, mtime, imported_at, metadata)
+           VALUES (?,?,?,?,?,?,?)""",
+        (str(path), source_type, conv_id, size, mtime, datetime.now().isoformat(),
+         json.dumps(metadata, ensure_ascii=False)),
+    )
+
+
 def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
-    stats = {"claude_code": 0, "workbuddy": 0, "pi": 0, "messages": 0}
+    stats = {"claude_code": 0, "workbuddy": 0, "pi": 0, "codex": 0, "messages": 0}
 
     sources = {
         "claude_code": {
@@ -1107,6 +1670,12 @@ def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
                 if source_name == "claude_code" and _is_sidechain(jsonl_file):
                     continue
                 try:
+                    size, mtime, unchanged = _file_scan_state(conn, jsonl_file)
+                except OSError:
+                    continue
+                if unchanged:
+                    continue
+                try:
                     messages = _parse_jsonl(jsonl_file, source_name)
                 except Exception as e:
                     _log(f"解析失败 {jsonl_file.name}: {e}")
@@ -1116,12 +1685,9 @@ def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
                     continue
 
                 conv_id = f"{cfg['prefix']}{jsonl_file.stem}"
-                if conn.execute("SELECT 1 FROM conversations WHERE id=?", (conv_id,)).fetchone():
-                    continue
 
                 conv_name = messages[0]["text"][:80]
                 created = messages[0].get("created_at", "")
-                total_chars = sum(len(m["text"]) for m in messages)
 
                 model = ""
                 if source_name == "workbuddy":
@@ -1140,30 +1706,131 @@ def _scan_data_dirs(conn: sqlite3.Connection) -> dict:
                 if model:
                     meta_dict["model"] = model
 
-                conn.execute(
-                    """INSERT OR IGNORE INTO conversations
-                       (id, source_type, name, summary, message_count, total_chars,
-                        created_at, updated_at, imported_at, process_status, metadata)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                    (conv_id, source_name, conv_name, "", len(messages), total_chars,
-                     created, messages[-1].get("created_at", created),
-                     datetime.now().isoformat(), "pending",
-                     json.dumps(meta_dict, ensure_ascii=False)),
+                inserted = _upsert_conversation(
+                    conn,
+                    conv_id=conv_id,
+                    source_type=source_name,
+                    conv_name=conv_name,
+                    messages=messages,
+                    created=created,
+                    metadata=meta_dict,
+                )
+                _record_import_state(
+                    conn,
+                    path=jsonl_file,
+                    source_type=source_name,
+                    conv_id=conv_id,
+                    size=size,
+                    mtime=mtime,
+                    metadata=meta_dict,
                 )
 
-                for seq, msg in enumerate(messages):
-                    conn.execute(
-                        """INSERT OR IGNORE INTO conversation_messages
-                           (id, conversation_id, sender, text, sequence, created_at)
-                           VALUES (?,?,?,?,?,?)""",
-                        (f"{conv_id}_{seq}", conv_id, msg["sender"], msg["text"], seq, msg.get("created_at", "")),
-                    )
-
                 conn.commit()
-                stats[source_name] += 1
-                stats["messages"] += len(messages)
+                if inserted:
+                    stats[source_name] += 1
+                    stats["messages"] += inserted
+
+    codex_stats = _scan_codex_dirs(conn)
+    stats["codex"] += codex_stats["codex"]
+    stats["messages"] += codex_stats["messages"]
 
     return stats
+
+
+def _scan_codex_dirs(conn: sqlite3.Connection) -> dict:
+    stats = {"codex": 0, "messages": 0}
+    roots = [
+        Path.home() / ".codex" / "sessions",
+        Path.home() / ".codex" / "archived_sessions",
+    ]
+
+    for root in roots:
+        if not root.exists():
+            _log(f"codex: 目录不存在，跳过 {root}")
+            continue
+
+        for jsonl_file in sorted(root.rglob("*.jsonl")):
+            try:
+                size, mtime, unchanged = _file_scan_state(conn, jsonl_file)
+            except OSError:
+                continue
+            if unchanged:
+                continue
+            try:
+                meta = _read_codex_meta(jsonl_file)
+                messages = _parse_jsonl(jsonl_file, "codex")
+            except Exception as e:
+                _log(f"解析失败 {jsonl_file.name}: {e}")
+                continue
+
+            if len(messages) < 2:
+                continue
+
+            conv_id = f"codex_{jsonl_file.stem}"
+
+            cwd = meta.get("cwd", "")
+            project = _project_name_from_path(cwd)
+            conv_name = messages[0]["text"][:80]
+            created = messages[0].get("created_at", "") or meta.get("timestamp", "")
+            meta_dict = {
+                "project": project,
+                "cwd": cwd,
+                "originator": meta.get("originator", ""),
+                "cli_version": meta.get("cli_version", ""),
+            }
+
+            inserted = _upsert_conversation(
+                conn,
+                conv_id=conv_id,
+                source_type="codex",
+                conv_name=conv_name,
+                messages=messages,
+                created=created,
+                metadata=meta_dict,
+            )
+            _record_import_state(
+                conn,
+                path=jsonl_file,
+                source_type="codex",
+                conv_id=conv_id,
+                size=size,
+                mtime=mtime,
+                metadata=meta_dict,
+            )
+
+            conn.commit()
+            if inserted:
+                stats["codex"] += 1
+                stats["messages"] += inserted
+
+    return stats
+
+
+def _read_codex_meta(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line.strip())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if obj.get("type") == "session_meta":
+                payload = obj.get("payload", {})
+                return {
+                    "id": payload.get("id", ""),
+                    "timestamp": payload.get("timestamp", obj.get("timestamp", "")),
+                    "cwd": payload.get("cwd", ""),
+                    "originator": payload.get("originator", ""),
+                    "cli_version": payload.get("cli_version", ""),
+                }
+    return {}
+
+
+def _project_name_from_path(path_value: str) -> str:
+    if not path_value:
+        return "unknown"
+    normalized = path_value.rstrip("\\/")
+    name = Path(normalized).name
+    return name or normalized
 
 
 # ── JSONL 解析器 ──────────────────────────────────────
@@ -1200,6 +1867,8 @@ def _parse_jsonl(path: Path, source: str) -> list[dict]:
                 msg = _parse_cc_line(obj)
             elif source == "pi":
                 msg = _parse_pi_line(obj)
+            elif source == "codex":
+                msg = _parse_codex_line(obj)
             else:
                 msg = _parse_wb_line(obj)
 
@@ -1258,7 +1927,12 @@ def _parse_pi_line(obj: dict) -> dict | None:
     if isinstance(ts, (int, float)):
         ts = datetime.fromtimestamp(ts / 1000).isoformat()
 
-    return {"sender": "human" if role == "user" else "assistant", "text": text.strip(), "created_at": ts}
+    return {
+        "sender": "human" if role == "user" else "assistant",
+        "text": text.strip(),
+        "created_at": ts,
+        "source_id": obj.get("id") or msg.get("id", ""),
+    }
 
 
 def _parse_cc_line(obj: dict) -> dict | None:
@@ -1280,7 +1954,12 @@ def _parse_cc_line(obj: dict) -> dict | None:
     if isinstance(ts, (int, float)):
         ts = datetime.fromtimestamp(ts / 1000).isoformat()
 
-    return {"sender": "human" if obj["type"] == "user" else "assistant", "text": text.strip(), "created_at": ts}
+    return {
+        "sender": "human" if obj["type"] == "user" else "assistant",
+        "text": text.strip(),
+        "created_at": ts,
+        "source_id": obj.get("uuid") or msg.get("id", ""),
+    }
 
 
 def _extract_cc_text(content, msg_type: str) -> str:
@@ -1344,7 +2023,53 @@ def _parse_wb_line(obj: dict) -> dict | None:
     if isinstance(ts, (int, float)):
         ts = datetime.fromtimestamp(ts / 1000).isoformat()
 
-    return {"sender": "human" if role == "user" else "assistant", "text": text, "created_at": ts}
+    return {
+        "sender": "human" if role == "user" else "assistant",
+        "text": text,
+        "created_at": ts,
+        "source_id": obj.get("id", ""),
+    }
+
+
+def _parse_codex_line(obj: dict) -> dict | None:
+    if obj.get("type") != "response_item":
+        return None
+    payload = obj.get("payload", {})
+    if payload.get("type") != "message":
+        return None
+
+    role = payload.get("role", "")
+    if role not in ("user", "assistant"):
+        return None
+
+    text = _extract_codex_text(payload.get("content", []))
+    if not text:
+        return None
+    if role == "user" and text.strip().startswith("<environment_context>"):
+        return None
+
+    return {
+        "sender": "human" if role == "user" else "assistant",
+        "text": text.strip(),
+        "created_at": obj.get("timestamp", ""),
+        "source_id": payload.get("id") or obj.get("id", ""),
+    }
+
+
+def _extract_codex_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text", "")
+        if text:
+            parts.append(text.strip())
+    return "\n".join(p for p in parts if p)
 
 
 # ── 入口 ──────────────────────────────────────────────
@@ -1471,7 +2196,7 @@ def _bg_scan_loop():
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=wal")
             stats = _scan_data_dirs(conn)
-            new_count = stats["claude_code"] + stats["workbuddy"] + stats.get("pi", 0)
+            new_count = stats["claude_code"] + stats["workbuddy"] + stats.get("pi", 0) + stats.get("codex", 0)
             if new_count > 0:
                 _rebuild_fts(conn)
                 _detect_active_session()
@@ -1488,8 +2213,13 @@ def main():
 
     # 启动后台扫描线程（daemon，主线程退出时自动终止）
     global _bg_thread
-    _bg_thread = threading.Thread(target=_bg_scan_loop, daemon=True)
-    _bg_thread.start()
+    global _bg_thread, _scan_lock_file
+    _scan_lock_file = _try_acquire_scan_lock()
+    if _scan_lock_file is not None:
+        _bg_thread = threading.Thread(target=_bg_scan_loop, daemon=True)
+        _bg_thread.start()
+    else:
+        _log("background importer already owned by another rolling-memory MCP process")
 
     mcp.run(transport="stdio")
 
