@@ -7,3 +7,8 @@ __pycache__/
 dist/
 build/
 .env
+.vendor/
+.release_test/
+.semantic_test/
+rm_e2e_*/
+rm_gemini_*/

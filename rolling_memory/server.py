@@ -21,7 +21,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -58,11 +57,11 @@ _active_cc_conv: str | None = None
 # 当前项目名（用于默认项目过滤）
 _current_project: str = ""
 _scan_lock_file = None
+_state_lock = threading.Lock()  # 保护全局状态的锁
 
 
 def _detect_active_session():
     """检测当前正在进行的会话和项目（Claude Code / Pi）"""
-    global _active_cc_conv, _current_project
 
     latest_file = None
     latest_mtime = 0
@@ -103,9 +102,27 @@ def _detect_active_session():
                 except OSError:
                     continue
 
+    # Codex
+    codex_dir = Path.home() / ".codex" / "sessions"
+    if codex_dir.exists():
+        for jsonl_file in codex_dir.rglob("*.jsonl"):
+            try:
+                mtime = jsonl_file.stat().st_mtime
+                if mtime > latest_mtime:
+                    meta = _read_codex_meta(jsonl_file)
+                    cwd = meta.get("cwd", "")
+                    latest_mtime = mtime
+                    latest_file = jsonl_file
+                    latest_project = _project_name_from_path(cwd)
+                    latest_prefix = "codex_"
+            except OSError:
+                continue
+
     if latest_file:
-        _active_cc_conv = f"{latest_prefix}{latest_file.stem}"
-        _current_project = latest_project
+        with _state_lock:
+            global _active_cc_conv, _current_project
+            _active_cc_conv = f"{latest_prefix}{latest_file.stem}"
+            _current_project = latest_project
         _log(f"当前项目: {_current_project}, 活跃会话: {_active_cc_conv}")
 
 
@@ -114,9 +131,10 @@ def _text(lines: list[str]) -> str:
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=wal")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -173,7 +191,8 @@ def _apply_time_decay(scored: list, decay: float) -> list:
             dt = datetime.fromisoformat(created[:10])
             days_old = max((now - dt).days, 0)
         except (ValueError, IndexError):
-            days_old = 365
+            # 解析失败时不做衰减，保持原始分数
+            days_old = 0
         recency = 1.0 / (1.0 + days_old * decay)
         final = score * (BASE_WEIGHT + RECENCY_WEIGHT * recency)
         result.append((final, r))
@@ -207,13 +226,23 @@ def _build_filters(source: str, date_from: str, date_to: str,
 
 
 def _project_where(project: str, table_prefix: str = "c") -> tuple[str, list]:
-    """构建项目过滤条件。project="" 表示不过滤。"""
+    """构建项目过滤条件。project="" 表示不过滤。LIKE 通配符已转义。"""
     if not project:
         return "", []
-    return f"AND {table_prefix}.metadata LIKE ?", [f'%"project": "{project}"%']
+    # 转义 LIKE 通配符 % 和 _
+    escaped = project.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"AND {table_prefix}.metadata LIKE ? ESCAPE '\\'", [f'%"project": "{escaped}"%']
 
 
 # ── memory_search: 核心搜索 ───────────────────────────
+
+def _fts_query(query: str) -> str:
+    """Build a recall-oriented FTS5 query from natural language input."""
+    tokens = re.findall(r"\w+", query, flags=re.UNICODE)
+    if not tokens:
+        return re.sub(r'[*()^|:=+]', ' ', query).strip() or query
+    return " ".join(f'"{token}"' for token in tokens)
+
 
 @mcp.tool(annotations=READ_ONLY)
 def memory_search(
@@ -239,8 +268,12 @@ def memory_search(
     conn = _conn()
     try:
         if mode == "semantic":
-            return _search_semantic(conn, query, source, date_from, date_to,
-                                    scope, time_decay, top_k, exclude_current)
+            # semantic 模式走 message_embeddings 向量搜索（P2）
+            return _search_vectors(conn, query, source, date_from, date_to,
+                                   time_decay, top_k, exclude_current, project)
+        elif mode == "hybrid":
+            return _search_hybrid(conn, query, source, date_from, date_to,
+                                  time_decay, top_k, exclude_current, project)
         else:
             return _search_keyword(conn, query, source, date_from, date_to,
                                    scope, time_decay, top_k, exclude_current,
@@ -255,10 +288,8 @@ def _search_keyword(conn, query, source, date_from, date_to,
     exclude = _active_cc_conv if exclude_current else ""
     proj = _current_project if project == "current" else project
 
-    if " " in query or "-" in query or "." in query:
-        fts_query = f'"{query}"'
-    else:
-        fts_query = query
+    # 清洗 FTS 特殊字符（先清洗再决定是否加引号）
+    fts_query = _fts_query(query)
 
     if scope == "chunks":
         return _search_keyword_chunks(conn, fts_query, query, source,
@@ -356,12 +387,12 @@ def _search_semantic(conn, query, source, date_from, date_to,
                      scope, time_decay, top_k, exclude_current=True) -> str:
     try:
         import numpy as np
-        from rolling_memory.embedding import get_embedding
+        from rolling_memory.embedding import get_engine
     except ImportError:
         return "语义搜索(P2)需要 BGE-M3 模型，请先用 mode=keyword。P2 正在整理中，敬请期待。"
 
-    bge = get_embedding()
-    q_vec = bge.encode([query])[0]
+    engine = get_engine()
+    q_vec = engine.encode_dense([query])[0]
     q_norm = q_vec / (np.linalg.norm(q_vec) + 1e-8)
 
     where, params = _build_filters(source, date_from, date_to, table_prefix="cs")
@@ -607,8 +638,13 @@ def memory_stats() -> str:
         try:
             embed_count = conn.execute("SELECT count(*) FROM message_embeddings").fetchone()[0]
             total_msgs = conn.execute("SELECT count(*) FROM conversation_messages").fetchone()[0]
-            unembedded = total_msgs - embed_count
-            lines.append(f"\n向量: {embed_count}/{total_msgs} 条消息已嵌入")
+            # 一个消息可能有多个 chunk，所以用未嵌入消息数而非差值
+            unembedded = conn.execute("""
+                SELECT COUNT(*) FROM conversation_messages msg
+                LEFT JOIN message_embeddings me ON me.message_id = msg.id
+                WHERE me.message_id IS NULL AND LENGTH(msg.text) >= 10
+            """).fetchone()[0]
+            lines.append(f"\n向量: {embed_count} 条 chunk 已嵌入（{total_msgs} 条消息）")
             if unembedded > 0:
                 lines.append(f"  {unembedded} 条消息未嵌入，调用 memory_embed 启用语义搜索")
         except sqlite3.OperationalError:
@@ -628,7 +664,8 @@ def memory_recent(days: int = 7, source: str = "", limit: int = 20) -> str:
     try:
         where, params = _build_filters(source, "", "")
         if days > 0:
-            where += f" AND c.created_at >= date('now', '-{days} days')"
+            where += " AND c.created_at >= date('now', ? || ' days')"
+            params.append(f"-{int(days)}")
 
         # Try conv_index (P3) first, fallback to conversations (P1)
         try:
@@ -724,13 +761,17 @@ _FORBIDDEN = re.compile(r"\b(DROP|DELETE|INSERT|UPDATE|ALTER|CREATE|ATTACH|DETAC
 def memory_query(sql: str, limit: int = 50) -> str:
     """自由SQL查询(只读)。表: conversations, conversation_messages, conv_index, conv_segments, conv_relations。
     只允许SELECT。"""
+    # 只允许单条 SELECT，禁止多语句注入
+    sql = sql.strip().rstrip(";")
+    if ";" in sql:
+        return "只允许单条 SELECT 查询"
     if not _SAFE_SQL_RE.match(sql):
         return "只允许 SELECT 查询"
     if _FORBIDDEN.search(sql):
         return "禁止修改操作"
 
     if "LIMIT" not in sql.upper():
-        sql = sql.rstrip(";") + f" LIMIT {limit}"
+        sql = sql + f" LIMIT {limit}"
 
     conn = _conn()
     try:
@@ -759,15 +800,24 @@ def memory_query(sql: str, limit: int = 50) -> str:
 # ── memory_embed: 生成向量 ────────────────────────────
 
 def _get_unembedded_ids(conn: sqlite3.Connection, limit: int = 500) -> list[str]:
-    """获取未嵌入的消息 ID 列表"""
+    """获取未嵌入的消息 ID 列表（message_id 为真实消息 ID）"""
     rows = conn.execute("""
-        SELECT msg.id FROM conversation_messages msg
+        SELECT msg.id, msg.text, COUNT(me.chunk_index) as embedded_chunks
+        FROM conversation_messages msg
         LEFT JOIN message_embeddings me ON me.message_id = msg.id
-        WHERE me.message_id IS NULL AND LENGTH(msg.text) >= 10
+        WHERE LENGTH(msg.text) >= 10
+        GROUP BY msg.id
         ORDER BY msg.created_at DESC
         LIMIT ?
-    """, (limit,)).fetchall()
-    return [r["id"] for r in rows]
+    """, (max(limit * 3, limit),)).fetchall()
+    ids = []
+    for r in rows:
+        expected_chunks = len(_chunk_text(r["text"] or ""))
+        if int(r["embedded_chunks"] or 0) < expected_chunks:
+            ids.append(r["id"])
+            if len(ids) >= limit:
+                break
+    return ids
 
 
 def _chunk_text(text: str, max_tokens: int = 2000) -> list[str]:
@@ -843,34 +893,38 @@ def memory_embed(
         batch_ids = []
         batch_chunks = []  # (msg_id, chunk_idx, text)
 
-        # 准备数据：长文本切 chunk
+        # 准备数据：长文本切 chunk，同时获取 conversation_id
         placeholders = ",".join("?" * len(unembedded_ids))
         rows = conn.execute(
-            f"SELECT id, text FROM conversation_messages WHERE id IN ({placeholders})",
+            f"SELECT id, text, conversation_id FROM conversation_messages WHERE id IN ({placeholders})",
             unembedded_ids
         ).fetchall()
 
+        # 消息ID → conversation_id 映射
+        msg_conv_map = {r["id"]: r["conversation_id"] for r in rows}
+
         for r in rows:
             chunks = _chunk_text(r["text"])
+            conv_id = r["conversation_id"]
             for ci, chunk in enumerate(chunks):
-                batch_chunks.append((r["id"], ci, chunk))
+                batch_chunks.append((r["id"], ci, chunk, conv_id))
 
         _log(f"共 {len(batch_chunks)} 个 chunk 待编码")
 
         bs = batch_size if batch_size > 0 else 24
-        for msg_id, chunk_idx, text in batch_chunks:
+        for msg_id, chunk_idx, text, conv_id in batch_chunks:
             batch_texts.append(text)
-            batch_ids.append((msg_id, chunk_idx))
+            batch_ids.append((msg_id, chunk_idx, conv_id))
 
             if len(batch_texts) >= bs:
                 vecs = engine.encode_dense(batch_texts, batch_size=bs)
-                for (mid, ci), vec in zip(batch_ids, vecs):
+                for idx, ((mid, ci, cid), vec) in enumerate(zip(batch_ids, vecs)):
                     blob = engine.vec_to_blob(vec)
                     conn.execute(
                         "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
-                        (f"{mid}_{ci}", mid.rsplit("_", 1)[0] if "_" in mid else mid, blob, ci, len(batch_texts[0]))
+                        (mid, cid, blob, ci, len(batch_texts[idx]))
                     )
-                conn.commit()
+                conn.commit()  # 每个 batch 原子提交
                 processed += len(batch_texts)
                 batch_texts = []
                 batch_ids = []
@@ -878,11 +932,11 @@ def memory_embed(
         # 处理剩余
         if batch_texts:
             vecs = engine.encode_dense(batch_texts, batch_size=bs)
-            for (mid, ci), vec in zip(batch_ids, vecs):
+            for idx, ((mid, ci, cid), vec) in enumerate(zip(batch_ids, vecs)):
                 blob = engine.vec_to_blob(vec)
                 conn.execute(
                     "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
-                    (f"{mid}_{ci}", mid.rsplit("_", 1)[0] if "_" in mid else mid, blob, ci, len(batch_texts[0]))
+                    (mid, cid, blob, ci, len(batch_texts[idx]))
                 )
             conn.commit()
             processed += len(batch_texts)
@@ -898,7 +952,219 @@ def memory_embed(
         conn.close()
 
 
-# ── memory_search_vectors: 向量搜索 ───────────────────
+# ── 向量搜索（内部实现 + MCP 工具）──────────────────────
+
+def _search_vectors(conn, query, source, date_from, date_to,
+                    time_decay, top_k, exclude_current=True,
+                    project: str = "current",
+                    rerank: bool = False) -> str:
+    """统一向量搜索实现，基于 message_embeddings 表。"""
+    try:
+        import numpy as np
+        from rolling_memory.embedding import get_engine
+    except ImportError:
+        return "语义搜索(P2)需要 BGE-M3 模型，请先用 mode=keyword。"
+
+    embed_count = conn.execute("SELECT count(*) FROM message_embeddings").fetchone()[0]
+    if embed_count == 0:
+        return "无向量数据。请先调用 memory_embed 生成向量。"
+
+    exclude = _active_cc_conv if exclude_current else ""
+    where, params = _build_filters(source, date_from, date_to,
+                                   table_prefix="c", exclude_conv=exclude)
+    proj = _current_project if project == "current" else project
+    proj_where, proj_params = _project_where(proj)
+    where += proj_where
+    params += proj_params
+
+    engine = get_engine()
+    q_vec = engine.encode_dense([query])[0]
+
+    rows = conn.execute(f"""
+        SELECT me.message_id, me.conversation_id, me.dense_vector, me.chunk_index,
+               msg.text, msg.sender,
+               c.source_type as source, c.name as conv_name, c.created_at
+        FROM message_embeddings me
+        JOIN conversation_messages msg ON msg.id = me.message_id
+        JOIN conversations c ON c.id = me.conversation_id
+        WHERE 1=1 {where}
+    """, params).fetchall()
+
+    if not rows:
+        if not KEEP_MODEL:
+            engine.unload()
+        return "无匹配结果。"
+
+    scored = []
+    for r in rows:
+        vec = engine.blob_to_vec(r["dense_vector"])
+        score = float(np.dot(q_vec, vec))
+        scored.append((score, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    seen_msgs = set()
+    unique_scored = []
+    for score, r in scored:
+        mid = r["message_id"]
+        if mid not in seen_msgs:
+            seen_msgs.add(mid)
+            unique_scored.append((score, r))
+    candidates = unique_scored[:top_k * 5 if rerank else top_k]
+
+    if rerank and len(candidates) > top_k:
+        _log(f"ColBERT 精排: {len(candidates)} → {top_k}")
+        q_tokens = engine.encode_colbert([query])
+        doc_texts = [r["text"][:2000] for _, r in candidates]
+        doc_tokens = engine.encode_colbert(doc_texts)
+
+        reranked = []
+        for i, (score, r) in enumerate(candidates):
+            cb_score = engine.colbert_score(q_tokens[0], doc_tokens[i])
+            final_score = 0.4 * score + 0.6 * cb_score
+            reranked.append((final_score, r))
+        reranked.sort(key=lambda x: x[0], reverse=True)
+        candidates = reranked[:top_k]
+
+    if time_decay > 0:
+        candidates = _apply_time_decay(candidates, time_decay)
+
+    if not KEEP_MODEL:
+        engine.unload()
+
+    lines = [f"语义搜索 '{query}' — 找到 {len(candidates)} 条结果:"]
+    for score, r in candidates[:top_k]:
+        if score < 0.15:
+            continue
+        lines.append(f"- [{r['sender']}] {r['conv_name']}  (score={score:.3f}, {r['source']}, {r['created_at']})")
+        lines.append(f"  {(r['text'] or '')[:300]}")
+
+    if len([l for l in lines if l.startswith("-")]) == 0:
+        return f"未找到相关结果（相似度低于阈值）。"
+    return _text(lines)
+
+
+def _search_hybrid(conn, query, source, date_from, date_to,
+                   time_decay, top_k, exclude_current=True,
+                   project: str = "current") -> str:
+    """Hybrid search for the release path: FTS5 recall plus optional dense recall."""
+    exclude = _active_cc_conv if exclude_current else ""
+    proj = _current_project if project == "current" else project
+    where, params = _build_filters(source, date_from, date_to,
+                                   table_prefix="c", exclude_conv=exclude)
+    proj_where, proj_params = _project_where(proj)
+    where += proj_where
+    params += proj_params
+
+    fts_query = _fts_query(query)
+
+    combined: dict[str, dict] = {}
+    fts_ok = True
+    try:
+        rows = conn.execute(f"""
+            SELECT msg.id as message_id, msg.text, msg.sender,
+                   c.id as conversation_id, c.source_type as source,
+                   c.name as conv_name, c.created_at
+            FROM fts_chunks fts
+            JOIN conversation_messages msg ON msg.rowid = fts.rowid
+            JOIN conversations c ON c.id = msg.conversation_id
+            WHERE fts_chunks MATCH ? {where}
+            ORDER BY rank
+            LIMIT ?
+        """, [fts_query] + params + [max(top_k * 3, top_k)]).fetchall()
+    except sqlite3.OperationalError:
+        fts_ok = False
+        rows = conn.execute(f"""
+            SELECT msg.id as message_id, msg.text, msg.sender,
+                   c.id as conversation_id, c.source_type as source,
+                   c.name as conv_name, c.created_at
+            FROM conversation_messages msg
+            JOIN conversations c ON c.id = msg.conversation_id
+            WHERE msg.text LIKE ? {where}
+            LIMIT ?
+        """, [f"%{query}%"] + params + [max(top_k * 3, top_k)]).fetchall()
+
+    for idx, r in enumerate(rows):
+        mid = r["message_id"]
+        lexical = 1.0 / (idx + 1)
+        combined[mid] = {
+            "score": 0.65 * lexical,
+            "lexical": lexical,
+            "dense": 0.0,
+            "row": r,
+        }
+
+    dense_available = False
+    try:
+        import numpy as np
+        from rolling_memory.embedding import get_engine
+
+        if conn.execute("SELECT count(*) FROM message_embeddings").fetchone()[0] > 0:
+            dense_available = True
+            engine = get_engine()
+            q_vec = engine.encode_dense([query])[0]
+            dense_rows = conn.execute(f"""
+                SELECT me.message_id, me.dense_vector,
+                       msg.text, msg.sender,
+                       c.id as conversation_id, c.source_type as source,
+                       c.name as conv_name, c.created_at
+                FROM message_embeddings me
+                JOIN conversation_messages msg ON msg.id = me.message_id
+                JOIN conversations c ON c.id = me.conversation_id
+                WHERE 1=1 {where}
+            """, params).fetchall()
+            scored = []
+            for r in dense_rows:
+                score = float(np.dot(q_vec, engine.blob_to_vec(r["dense_vector"])))
+                scored.append((score, r))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            seen = set()
+            for raw_score, r in scored:
+                mid = r["message_id"]
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                dense = max(0.0, min(1.0, (raw_score + 1.0) / 2.0))
+                if mid in combined:
+                    combined[mid]["score"] += 0.35 * dense
+                    combined[mid]["dense"] = dense
+                else:
+                    combined[mid] = {
+                        "score": 0.35 * dense,
+                        "lexical": 0.0,
+                        "dense": dense,
+                        "row": r,
+                    }
+                if len(seen) >= max(top_k * 3, top_k):
+                    break
+            if not KEEP_MODEL:
+                engine.unload()
+    except ImportError:
+        pass
+    except Exception as e:
+        _log(f"hybrid dense search skipped: {e}")
+
+    if not combined:
+        return f"No memory found for '{query}'"
+
+    scored_items = [(item["score"], item["row"], item) for item in combined.values()]
+    if time_decay > 0:
+        decayed = _apply_time_decay([(score, row) for score, row, _ in scored_items], time_decay)
+        item_by_id = {item["row"]["message_id"]: item for item in combined.values()}
+        scored_items = [(score, row, item_by_id[row["message_id"]]) for score, row in decayed]
+    else:
+        scored_items.sort(key=lambda x: x[0], reverse=True)
+
+    mode_note = "FTS+dense" if dense_available else ("FTS" if fts_ok else "LIKE")
+    lines = [f"Hybrid search '{query}' ({mode_note}) found {min(len(scored_items), top_k)} results:"]
+    for score, r, item in scored_items[:top_k]:
+        lines.append(
+            f"- [{r['sender']}] {r['conv_name']} "
+            f"(score={score:.3f}, fts={item['lexical']:.3f}, dense={item['dense']:.3f}, "
+            f"{r['source']}, {r['created_at']})"
+        )
+        lines.append(f"  {(r['text'] or '')[:300]}")
+    return _text(lines)
+
 
 @mcp.tool(annotations=READ_ONLY)
 def memory_search_vectors(
@@ -917,85 +1183,9 @@ def memory_search_vectors(
     project: 项目名(默认"current")。"""
     conn = _conn()
     try:
-        # 检查是否有向量数据
-        embed_count = conn.execute("SELECT count(*) FROM message_embeddings").fetchone()[0]
-        if embed_count == 0:
-            return "无向量数据。请先调用 memory_embed 生成向量。"
-
-        # 过滤条件
-        where, params = _build_filters(source, date_from, date_to, table_prefix="c")
-        proj = _current_project if project == "current" else project
-        proj_where, proj_params = _project_where(proj)
-        where += proj_where
-        params += proj_params
-
-        from rolling_memory.embedding import get_engine
-        engine = get_engine()
-
-        # 查询 dense 向量
-        q_vec = engine.encode_dense([query])[0]
-
-        # 加载所有候选向量（后续可优化为 ANN 索引）
-        rows = conn.execute(f"""
-            SELECT me.message_id, me.conversation_id, me.dense_vector, me.chunk_index,
-                   msg.text, msg.sender,
-                   c.source_type as source, c.name as conv_name, c.created_at
-            FROM message_embeddings me
-            JOIN conversation_messages msg ON msg.id = me.message_id
-            JOIN conversations c ON c.id = me.conversation_id
-            WHERE 1=1 {where}
-        """, params).fetchall()
-
-        if not rows:
-            if not KEEP_MODEL:
-                engine.unload()
-            return "无匹配结果。"
-
-        # Dense cosine 排序
-        scored = []
-        for r in rows:
-            vec = engine.blob_to_vec(r["dense_vector"])
-            score = float(np.dot(q_vec, vec))
-            scored.append((score, r))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        candidates = scored[:top_k * 5 if rerank else top_k]
-
-        # ColBERT 精排（可选）
-        if rerank and len(candidates) > top_k:
-            _log(f"ColBERT 精排: {len(candidates)} → {top_k}")
-            q_tokens = engine.encode_colbert([query])
-            doc_texts = [r["text"][:2000] for _, r in candidates]
-            doc_tokens = engine.encode_colbert(doc_texts)
-
-            reranked = []
-            for i, (score, r) in enumerate(candidates):
-                cb_score = engine.colbert_score(q_tokens[0], doc_tokens[i])
-                # 融合: 0.4 * dense + 0.6 * colbert
-                final_score = 0.4 * score + 0.6 * cb_score
-                reranked.append((final_score, r))
-            reranked.sort(key=lambda x: x[0], reverse=True)
-            candidates = reranked[:top_k]
-
-        # 时间衰减
-        if time_decay > 0:
-            candidates = _apply_time_decay(candidates, time_decay)
-
-        # 卸载模型
-        if not KEEP_MODEL:
-            engine.unload()
-
-        # 输出
-        lines = [f"语义搜索 '{query}' — 找到 {len(candidates)} 条结果:"]
-        for score, r in candidates[:top_k]:
-            if score < 0.15:
-                continue
-            lines.append(f"- [{r['sender']}] {r['conv_name']}  (score={score:.3f}, {r['source']}, {r['created_at']})")
-            lines.append(f"  {(r['text'] or '')[:300]}")
-
-        if len([l for l in lines if l.startswith("-")]) == 0:
-            return f"未找到相关结果（相似度低于阈值）。"
-        return _text(lines)
+        return _search_vectors(conn, query, source, date_from, date_to,
+                               time_decay, top_k, exclude_current=False,
+                               project=project, rerank=rerank)
     finally:
         conn.close()
 
@@ -1053,8 +1243,13 @@ def memory_search_global(
     conn = _conn()
     try:
         if mode == "semantic":
-            return _search_semantic(conn, query, source, date_from, date_to,
-                                    scope, time_decay, top_k, exclude_current=False)
+            return _search_vectors(conn, query, source, date_from, date_to,
+                                   time_decay, top_k, exclude_current=False,
+                                   project="")
+        elif mode == "hybrid":
+            return _search_hybrid(conn, query, source, date_from, date_to,
+                                  time_decay, top_k, exclude_current=False,
+                                  project="")
         else:
             return _search_keyword(conn, query, source, date_from, date_to,
                                    scope, time_decay, top_k, exclude_current=False,
@@ -1284,6 +1479,17 @@ class _GeminiHTMLParser(HTMLParser):
 
     def _parse_cell(self, text: str):
         text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"View other drafts.*", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"Exported from.*", "", text, flags=re.IGNORECASE).strip()
+        if text.startswith("Prompted "):
+            text = text[len("Prompted "):].strip()
+
+        parsed = self._parse_common_cell(text)
+        if parsed is not None:
+            self.entries.append(parsed)
+            return
+
+        text = re.sub(r"\s+", " ", text).strip()
         text = re.sub(r"商品：.*", "", text, flags=re.DOTALL).strip()
         text = re.sub(r"为什么此处会显示此活动记录？.*", "", text, flags=re.DOTALL).strip()
 
@@ -1310,6 +1516,54 @@ class _GeminiHTMLParser(HTMLParser):
                 "ai_text": ai_text,
                 "timestamp": timestamp,
             })
+
+    def _parse_common_cell(self, text: str) -> dict | None:
+        patterns = [
+            re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([A-Z]{2,5})?"),
+            re.compile(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([A-Z]{2,5})?"),
+            re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?\s*([A-Z]{2,5})?"),
+            re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4}),?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?\s*([A-Z]{2,5})?"),
+        ]
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+
+            user_text = text[:match.start()].strip()
+            ai_text = text[match.end():].strip()
+            ai_text = re.sub(r"^(CST|UTC|PST|PDT|EST|EDT|GMT)\s+", "", ai_text).strip()
+            ai_text = re.sub(r"^(Gemini|Bard)\s+", "", ai_text, flags=re.IGNORECASE).strip()
+            groups = match.groups()
+
+            if groups[0].isalpha():
+                month_names = {
+                    "january": 1, "february": 2, "march": 3, "april": 4,
+                    "may": 5, "june": 6, "july": 7, "august": 8,
+                    "september": 9, "october": 10, "november": 11, "december": 12,
+                }
+                mo = month_names.get(groups[0].lower())
+                if not mo:
+                    continue
+                d, y = int(groups[1]), int(groups[2])
+                h, mi, sec = int(groups[3]), groups[4], groups[5] or "00"
+                ampm = groups[6]
+                if ampm:
+                    if ampm.upper() == "PM" and h < 12:
+                        h += 12
+                    elif ampm.upper() == "AM" and h == 12:
+                        h = 0
+            else:
+                y, mo, d = int(groups[0]), int(groups[1]), int(groups[2])
+                h, mi, sec = int(groups[3]), groups[4], groups[5] or "00"
+
+            if not user_text:
+                return None
+            return {
+                "user_text": user_text,
+                "ai_text": ai_text,
+                "timestamp": f"{int(y):04d}-{int(mo):02d}-{int(d):02d}T{int(h):02d}:{mi}:{sec}Z",
+            }
+        return None
 
 
 def _import_gemini_html(conn: sqlite3.Connection, html: str) -> dict:
@@ -1380,13 +1634,14 @@ def memory_import(path: str, source: str = "auto") -> str:
         try:
             html = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            html = file_path.read_text(encoding="utf-8", errors="ignore")
+            html = file_path.read_text(encoding="utf-8", errors="replace")
+            _log("HTML 文件存在编码问题，部分字符已替换")
 
         conn = _conn()
         try:
             result = _import_gemini_html(conn, html)
             if result["imported"] > 0:
-                _rebuild_fts(conn)
+                _incremental_fts(conn)
             lines = [
                 f"导入完成 (gemini):",
                 f"  新增: {result['imported']} 条 Q&A",
@@ -1401,64 +1656,74 @@ def memory_import(path: str, source: str = "auto") -> str:
     json_path = file_path
     tmp_dir = None
 
-    if file_path.suffix.lower() == ".zip":
-        tmp_dir = tempfile.mkdtemp(prefix="rolling_import_")
+    try:
+        if file_path.suffix.lower() == ".zip":
+            tmp_dir = tempfile.mkdtemp(prefix="rolling_import_")
+            MAX_ZIP_SIZE = 1_000_000_000  # 1GB 上限
+            try:
+                with zipfile.ZipFile(file_path, "r") as zf:
+                    # #8: 检查 ZIP 炸弹（总大小）
+                    total_size = sum(info.file_size for info in zf.infolist())
+                    if total_size > MAX_ZIP_SIZE:
+                        return f"ZIP 文件过大（{total_size // 1_000_000}MB），上限 1GB"
+
+                    # #9: 检查符号链接和路径穿越
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        if info.filename.startswith("/") or ".." in info.filename:
+                            return "ZIP 包含不安全路径，已拒绝"
+                        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                            return "ZIP 包含符号链接，已拒绝"
+
+                    zf.extractall(tmp_dir)
+            except zipfile.BadZipFile:
+                return f"无效的 ZIP 文件: {path}"
+
+            for candidate in Path(tmp_dir).rglob("conversations.json"):
+                json_path = candidate
+                break
+            else:
+                return f"ZIP 中未找到 conversations.json: {path}"
+
         try:
-            with zipfile.ZipFile(file_path, "r") as zf:
-                zf.extractall(tmp_dir)
-        except zipfile.BadZipFile:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            return f"无效的 ZIP 文件: {path}"
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return f"JSON 解析失败: {e}"
 
-        for candidate in Path(tmp_dir).rglob("conversations.json"):
-            json_path = candidate
-            break
-        else:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            return f"ZIP 中未找到 conversations.json: {path}"
+        if not isinstance(data, list):
+            return "文件格式错误：期望 JSON 数组"
 
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        if tmp_dir:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        return f"JSON 解析失败: {e}"
+        if source == "auto":
+            source = _detect_export_source(data)
+        if source not in ("claude", "chatgpt"):
+            return "无法识别导出格式。请指定 source=claude 或 source=chatgpt"
 
-    if not isinstance(data, list):
-        if tmp_dir:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        return "文件格式错误：期望 JSON 数组"
+        conn = _conn()
+        try:
+            if source == "claude":
+                result = _import_claude_json(conn, data)
+            else:
+                result = _import_chatgpt_json(conn, data)
 
-    if source == "auto":
-        source = _detect_export_source(data)
-    if source not in ("claude", "chatgpt"):
-        if tmp_dir:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        return f"无法识别导出格式。请指定 source=claude 或 source=chatgpt"
+            if result["imported"] > 0:
+                _incremental_fts(conn)
 
-    conn = _conn()
-    try:
-        if source == "claude":
-            result = _import_claude_json(conn, data)
-        else:
-            result = _import_chatgpt_json(conn, data)
-
-        if result["imported"] > 0:
-            _rebuild_fts(conn)
-
-        total = len(data)
-        lines = [
-            f"导入完成 ({source}):",
-            f"  总对话: {total}",
-            f"  新增/更新: {result['imported']}",
-            f"  跳过(空): {result['skipped']}",
-            f"  新增消息: {result['new_messages']}",
-        ]
-        return _text(lines)
+            total = len(data)
+            lines = [
+                f"导入完成 ({source}):",
+                f"  总对话: {total}",
+                f"  新增/更新: {result['imported']}",
+                f"  跳过(空): {result['skipped']}",
+                f"  新增消息: {result['new_messages']}",
+            ]
+            return _text(lines)
+        finally:
+            if conn:
+                conn.close()
     finally:
-        conn.close()
+        # #20: 确保临时目录始终被清理
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1492,6 +1757,7 @@ def _init_db(conn: sqlite3.Connection):
             metadata TEXT DEFAULT '{}'
         );
         CREATE INDEX IF NOT EXISTS idx_msg_conv ON conversation_messages(conversation_id);
+        CREATE INDEX IF NOT EXISTS idx_msg_dedup ON conversation_messages(conversation_id, sender, created_at);
 
         CREATE TABLE IF NOT EXISTS import_state (
             path TEXT PRIMARY KEY,
@@ -1511,17 +1777,43 @@ def _init_db(conn: sqlite3.Connection):
             tokenize='unicode61'
         );
 
-        -- P2: 消息级 dense 向量
+        -- P2: 消息级 dense 向量（复合主键：message_id + chunk_index）
         CREATE TABLE IF NOT EXISTS message_embeddings (
-            message_id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
             conversation_id TEXT NOT NULL,
             dense_vector BLOB NOT NULL,
             chunk_index INTEGER DEFAULT 0,
-            text_length INTEGER DEFAULT 0
+            text_length INTEGER DEFAULT 0,
+            PRIMARY KEY (message_id, chunk_index)
         );
         CREATE INDEX IF NOT EXISTS idx_me_conv ON message_embeddings(conversation_id);
     """)
     conn.commit()
+
+    # 迁移：旧版 message_embeddings 用单一主键 message_id（含 _chunk 后缀），
+    # 新版用复合主键 (message_id, chunk_index)。检测旧表并重建。
+    try:
+        pk_cols = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='message_embeddings'"
+        ).fetchone()
+        pk_sql = pk_cols["sql"] if isinstance(pk_cols, sqlite3.Row) else pk_cols[0]
+        if pk_cols and "PRIMARY KEY (message_id, chunk_index)" not in (pk_sql or ""):
+            _log("迁移 message_embeddings: 旧表结构，重建（需重新嵌入）")
+            conn.execute("DROP TABLE IF EXISTS message_embeddings")
+            conn.execute("""
+                CREATE TABLE message_embeddings (
+                    message_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    dense_vector BLOB NOT NULL,
+                    chunk_index INTEGER DEFAULT 0,
+                    text_length INTEGER DEFAULT 0,
+                    PRIMARY KEY (message_id, chunk_index)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_me_conv ON message_embeddings(conversation_id)")
+            conn.commit()
+    except Exception as e:
+        _log(f"迁移检查出错（可忽略）: {e}")
 
 
 def _rebuild_fts(conn: sqlite3.Connection):
@@ -1530,6 +1822,18 @@ def _rebuild_fts(conn: sqlite3.Connection):
     conn.commit()
     count = conn.execute("SELECT COUNT(*) FROM fts_chunks").fetchone()[0]
     _log(f"FTS5 索引完成: {count} 条")
+
+
+def _incremental_fts(conn: sqlite3.Connection):
+    """增量更新 FTS 索引。FTS5 content-sync 模式的 rebuild 从 content 表读取，
+    速度很快（毫秒级），所以直接 rebuild 比尝试 diff 更可靠。"""
+    try:
+        conn.execute("INSERT INTO fts_chunks(fts_chunks) VALUES('rebuild')")
+        conn.commit()
+        return 1
+    except Exception as e:
+        _log(f"FTS 更新失败: {e}")
+        return -1
 
 
 def _file_scan_state(conn: sqlite3.Connection, path: Path) -> tuple[int, float, bool]:
@@ -2076,6 +2380,7 @@ def _extract_codex_text(content) -> str:
 
 SCAN_INTERVAL = 30  # 增量扫描间隔（秒）
 _bg_thread: threading.Thread | None = None
+_bg_stop = threading.Event()  # 优雅关闭信号
 
 
 def _ensure_db_ready():
@@ -2089,24 +2394,23 @@ def _ensure_db_ready():
 
 
 def _auto_embed_check():
-    """检查是否有足够的未嵌入消息，自动触发 embedding"""
+    """检查是否有足够的未嵌入消息，自动触发 embedding（带重试）"""
     if not AUTO_EMBED:
         return
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         try:
-            unembedded = conn.execute("""
-                SELECT COUNT(*) FROM conversation_messages msg
-                LEFT JOIN message_embeddings me ON me.message_id = msg.id
-                WHERE me.message_id IS NULL AND LENGTH(msg.text) >= 10
-            """).fetchone()[0]
+            unembedded = len(_get_unembedded_ids(conn, limit=EMBED_BATCH))
         finally:
             conn.close()
 
-        if unembedded >= EMBED_BATCH:
-            _log(f"自动嵌入: {unembedded} 条未嵌入消息，开始处理...")
-            # 调用 memory_embed 逻辑（在主线程外，直接调内部函数）
+        if unembedded < EMBED_BATCH:
+            return
+
+        _log(f"自动嵌入: {unembedded} 条未嵌入消息，开始处理...")
+        # 带重试的嵌入（最多 3 次尝试）
+        for attempt in range(3):
             try:
                 conn = sqlite3.connect(DB_PATH)
                 conn.row_factory = sqlite3.Row
@@ -2116,27 +2420,27 @@ def _auto_embed_check():
                     engine = get_engine()
                     processed = 0
                     batch_texts = []
-                    batch_meta = []
+                    batch_meta = []  # (msg_id, chunk_idx, conv_id)
 
                     chunks = []
                     placeholders = ",".join("?" * len(ids))
                     rows = conn.execute(
-                        f"SELECT id, text FROM conversation_messages WHERE id IN ({placeholders})", ids
+                        f"SELECT id, text, conversation_id FROM conversation_messages WHERE id IN ({placeholders})", ids
                     ).fetchall()
                     for r in rows:
                         for ci, chunk in enumerate(_chunk_text(r["text"])):
-                            chunks.append((r["id"], ci, chunk))
+                            chunks.append((r["id"], ci, chunk, r["conversation_id"]))
 
-                    for msg_id, chunk_idx, text in chunks:
+                    for msg_id, chunk_idx, text, conv_id in chunks:
                         batch_texts.append(text)
-                        batch_meta.append((msg_id, chunk_idx))
+                        batch_meta.append((msg_id, chunk_idx, conv_id))
                         if len(batch_texts) >= 24:
                             vecs = engine.encode_dense(batch_texts)
-                            for (mid, ci), vec in zip(batch_meta, vecs):
+                            for (mid, ci, cid), vec in zip(batch_meta, vecs):
                                 blob = engine.vec_to_blob(vec)
                                 conn.execute(
                                     "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
-                                    (f"{mid}_{ci}", mid, blob, ci, len(text))
+                                    (mid, cid, blob, ci, len(text))
                                 )
                             conn.commit()
                             processed += len(batch_texts)
@@ -2144,11 +2448,11 @@ def _auto_embed_check():
 
                     if batch_texts:
                         vecs = engine.encode_dense(batch_texts)
-                        for (mid, ci), vec in zip(batch_meta, vecs):
+                        for (mid, ci, cid), vec in zip(batch_meta, vecs):
                             blob = engine.vec_to_blob(vec)
                             conn.execute(
                                 "INSERT OR REPLACE INTO message_embeddings (message_id, conversation_id, dense_vector, chunk_index, text_length) VALUES (?,?,?,?,?)",
-                                (f"{mid}_{ci}", mid, blob, ci, len(text))
+                                (mid, cid, blob, ci, len(text))
                             )
                         conn.commit()
                         processed += len(batch_texts)
@@ -2157,8 +2461,11 @@ def _auto_embed_check():
                         engine.unload()
                     _log(f"自动嵌入完成: {processed} 个 chunk")
                 conn.close()
+                break  # 成功，跳出重试循环
             except Exception as e:
-                _log(f"自动嵌入出错: {e}")
+                _log(f"自动嵌入出错 (尝试 {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(5)
     except Exception as e:
         _log(f"嵌入检查出错: {e}")
 
@@ -2190,15 +2497,17 @@ def _bg_scan_loop():
     _auto_embed_check()
 
     # 定期增量扫描
-    while True:
-        time.sleep(SCAN_INTERVAL)
+    while not _bg_stop.is_set():
+        _bg_stop.wait(SCAN_INTERVAL)  # 可被 _bg_stop.set() 唤醒
+        if _bg_stop.is_set():
+            break
         try:
             conn = sqlite3.connect(str(db_path))
             conn.execute("PRAGMA journal_mode=wal")
             stats = _scan_data_dirs(conn)
             new_count = stats["claude_code"] + stats["workbuddy"] + stats.get("pi", 0) + stats.get("codex", 0)
             if new_count > 0:
-                _rebuild_fts(conn)
+                _incremental_fts(conn)
                 _detect_active_session()
                 _log(f"增量扫描: +{new_count} 新对话, +{stats['messages']} 消息")
                 _auto_embed_check()
@@ -2212,7 +2521,6 @@ def main():
     _detect_active_session()
 
     # 启动后台扫描线程（daemon，主线程退出时自动终止）
-    global _bg_thread
     global _bg_thread, _scan_lock_file
     _scan_lock_file = _try_acquire_scan_lock()
     if _scan_lock_file is not None:
